@@ -1,0 +1,9 @@
+# 统一行尾（Windows 上 Git 默认会把 LF 转 CRLF，导致每次 checkout 都"全文件改动"）
+* text=auto eol=lf
+
+# 二进制文件按原样存
+*.exe binary
+*.png binary
+*.jpg binary
+*.zst binary
+*.sqlite binary

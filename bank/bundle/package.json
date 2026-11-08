@@ -1,0 +1,15 @@
+{
+  "name": "dsh-memory-bank-hooks",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Memory Bank 钩子桥接包装包：把 @deepseek-ai/dsh-hooks-claude-code 以 bundle 层挂载，并注入 configPath",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-hooks-claude-code": "link:E:/dsh-hooks-bridge"
+  }
+}

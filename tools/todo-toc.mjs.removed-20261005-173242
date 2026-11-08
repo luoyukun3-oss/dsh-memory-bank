@@ -1,0 +1,145 @@
+#!/usr/bin/env node
+// ============================================================================
+// todo-toc.mjs —— 为待办文件生成/刷新顶部「精准目录」（TOC）块
+//
+// 为什么：注入里不再逐条列出待办（太吃配额），只留
+//   ① 这个目录块（一行一组、带正文行号）
+//   ② 定时条目的完整 detail（由 bootstrap 的 indexList 另拼）
+// 目录块每行以 "> " 开头 ⇒ 面板（dsh-todo-panel）与旧解析规则都会跳过，不污染面板。
+//
+// 用法：
+//   node todo-toc.mjs                 # 刷新（自动备份）
+//   node todo-toc.mjs --check         # 只报告是否过期，不写
+//   node todo-toc.mjs --file <路径>
+//
+// 结构固定为：`# 标题` + 空行 + [块] + 空行 + 原正文
+//   ⇒ 条目行号偏移恒为「块行数 + 2」，且重复运行结果一致（幂等；写入后自校验）。
+// ============================================================================
+import fs from 'node:fs';
+import path from 'node:path';
+
+const argv = process.argv.slice(2);
+const opt = (n) => { const i = argv.indexOf(n); return i >= 0 ? argv[i + 1] : undefined; };
+const CHECK = argv.includes('--check');
+const FILE = opt('--file') || 'E:/2/_dsh_memory/repos/e-2/pages/todos.md';
+
+const BEGIN_RE = /^<!--\s*TOC:BEGIN[\s\S]*?-->\s*$/;
+const END_RE = /^<!--\s*TOC:END\s*-->\s*$/;
+const BEGIN_LINE = '<!-- TOC:BEGIN —— 自动生成（_dsh_memory/tools/todo-toc.mjs），勿手改 -->';
+const END_LINE = '<!-- TOC:END -->';
+
+/** 按记忆银行 indexList 的口径解析条目（跳过 `>` 引用、`[x]` 已完成；## 分段）。 */
+function parseItems(lines) {
+  const sections = [];
+  let cur = null;
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i];
+    const text = raw.trim();
+    if (text.startsWith('>')) continue;
+    const h = /^#{2,3}\s+(.+?)\s*$/.exec(text);
+    if (h) { cur = { title: h[1], items: [] }; sections.push(cur); continue; }
+    const m = /^\s*[-*]\s+\[([ xX])\]\s*(.+?)\s*$/.exec(raw);
+    let body = null, done = false;
+    if (m) { done = m[1].toLowerCase() === 'x'; body = m[2]; }
+    else {
+      const bare = /^\s*[-*]\s+(?!\[)(\S.*?)\s*$/.exec(raw);
+      if (!bare) continue;
+      body = bare[1];
+    }
+    if (done) continue;
+    if (!body || body.startsWith('<')) continue;
+    if (!cur) { cur = { title: '(未分组)', items: [] }; sections.push(cur); }
+    let title = body, detail = '';
+    const b = /^\*\*(.+?)\*\*\s*[：:]?\s*([\s\S]*)$/.exec(body);
+    if (b) { title = b[1].trim(); detail = b[2].trim(); }
+    const SCHED = /\[(at:[^\]]+|daily:[^\]]*|weekly:[^\]]*|\d{1,2}:\d{2})\]/i;
+    const sc = SCHED.exec(title + ' ' + detail);
+    const clean = (s) => s.replace(new RegExp(SCHED.source, 'gi'), '').replace(/\s+/g, ' ').trim();
+    cur.items.push({ title: clean(title), detail: clean(detail), line: i + 1, sched: sc ? sc[1] : null });
+  }
+  return sections.filter((s) => s.items.length > 0);
+}
+
+/** 精简条目名：优先取【…】里的要点，去掉日期与括号补充，超长截断。 */
+function shortName(it, max = 18) {
+  let t = it.title;
+  const br = /【(.+?)】/.exec(t);
+  if (br) t = br[1];
+  t = t.replace(/^\d{4}-\d{2}-\d{2}\s*/, '').replace(/[（(][^（()）]*[)）]/g, '').replace(/\s+/g, ' ').trim();
+  return t.length > max ? t.slice(0, max) : t;
+}
+
+/** 生成目录块内容（不含标记行）。offset 为条目行号相对 parseItems 结果的偏移。 */
+function tocLines(sections, offset) {
+  const all = sections.flatMap((s) => s.items);
+  const timed = all.filter((it) => it.sched);
+  const out = [];
+  out.push(`> **待办 ${all.length} 条** ｜ ` + sections.map((s) => `${s.title} ${s.items.length}`).join(' ｜ '));
+  if (timed.length) {
+    out.push('> ⏰ 定时：' + timed.map((it) => {
+      const when = /^at:/i.test(it.sched) ? it.sched.slice(3) : it.sched;
+      return `${when} ${shortName(it)}`;
+    }).join(' ｜ ') + '（到点自动派发，正文见下）');
+  }
+  for (const s of sections) {
+    out.push('> · ' + s.title + '：' + s.items.map((it) => `${shortName(it)} L${it.line + offset}`).join(' · '));
+  }
+  return out;
+}
+
+// ---- 1) 去掉旧块（连同紧邻空行），还原成“干净正文” ----
+const src = fs.readFileSync(FILE, 'utf8').replace(/^\uFEFF/, '');
+const lines = src.split('\n');
+let clean = lines.slice();
+const bi = clean.findIndex((l) => BEGIN_RE.test(l.trim()));
+const ei = clean.findIndex((l) => END_RE.test(l.trim()));
+if (bi >= 0 && ei > bi) {
+  let from = bi, to = ei;
+  if (clean[from - 1] !== undefined && clean[from - 1].trim() === '') from -= 1;   // 块前空行
+  if (clean[to + 1] !== undefined && clean[to + 1].trim() === '') to += 1;         // 块后空行
+  clean = clean.slice(0, from).concat(clean.slice(to + 1));
+}
+
+// ---- 2) 决定插入点（第一个 `# ` 标题之后，否则文件最前）----
+const h1 = clean.findIndex((l) => /^#\s+/.test(l.trim()));
+const at = h1 >= 0 ? h1 + 1 : 0;
+
+// ---- 3) 两遍：先估块行数算偏移，再用真实行号重算；插入后自校验 ----
+function assemble(blockLines) {
+  return clean.slice(0, at).concat([''], blockLines, [''], clean.slice(at)).join('\n');
+}
+
+const sections0 = parseItems(clean);
+const probe = [BEGIN_LINE, ...tocLines(sections0, 0), END_LINE];
+const offset = probe.length + 2;                       // 前空行 + 块 + 后空行
+const block = [BEGIN_LINE, ...tocLines(sections0, offset), END_LINE];
+
+const newText = assemble(block);
+
+console.log(`待办 ${sections0.flatMap((s) => s.items).length} 条 ｜ ` +
+  `定时 ${sections0.flatMap((s) => s.items).filter((i) => i.sched).length} 条 ｜ 分组 ${sections0.length} 个`);
+console.log(tocLines(sections0, offset).join('\n'));
+console.log(`\n块 ${block.length} 行 ｜ 目录字数 ${tocLines(sections0, offset).join('').replace(/\s/g, '').length}`);
+
+// 自校验：用「已插入块的新文本」再解析一次 —— 此时条目行号就是真实行号（偏移 0）。
+// 两份目录文本必须逐字一致：既验证行号写对了，也验证幂等（再跑一遍不会变）。
+const verifySections = parseItems(newText.split('\n'));
+const written = tocLines(sections0, offset).join('\n');
+const actual = tocLines(verifySections, 0).join('\n');
+const idempotent = written === actual;
+console.log(idempotent ? '✓ 自校验通过（目录行号 = 新文件真实行号，且幂等）' : '⚠️ 自校验失败 ⇒ 别写入');
+if (!idempotent) console.log('  目录写的:\n' + written + '\n  实际应为:\n' + actual);
+
+if (CHECK) {
+  console.log(newText === src ? '✓ 目录是最新的' : '⚠️ 目录已过期（跑不带 --check 刷新）');
+  process.exit(0);
+}
+if (newText === src) { console.log('✓ 无需改动'); process.exit(0); }
+if (!idempotent) { console.log('⇒ 已中止，不写入'); process.exit(1); }
+
+const d = new Date();
+const p = (n) => String(n).padStart(2, '0');
+const stamp = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+fs.writeFileSync(`${FILE}.bak-${stamp}`, src, 'utf8');
+fs.writeFileSync(FILE, newText, 'utf8');
+console.log(`✓ 已刷新（备份 ${path.basename(FILE)}.bak-${stamp}）`);

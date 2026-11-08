@@ -1,0 +1,12 @@
+# Memory Bank 钩子层（bundle 层 patch）—— 官方桌面版 0.2 专用副本
+# 由 dsh-memory-bank-hooks 包提供。
+# 关键：新增条目必须写在 `insert:` 下面（平铺写法会被当作"覆盖已存在条目"而报 entry not found）。
+# 同理，profile 自己的 cordis.patch.yml（用户层）只能覆盖/禁用已存在条目，不能新增插件
+# —— 所以这份必须作为 bundle 层被挂进 profile 的 dsh.profile.bundles。
+- insert:
+    - id: mem-bank-hooks
+      name: '@deepseek-ai/dsh-hooks-claude-code'
+      config:
+        configPath: E:/2/_dsh_memory/bank/hooks/hooks.json
+        projectDir: E:/2
+        defaultTimeoutMs: 30000

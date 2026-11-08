@@ -1,0 +1,84 @@
+# ============================================================================
+# Memory Bank · .gitignore
+#
+# 原则：**只让代码和模板进仓库，个人记忆与运行时数据一律不出去。**
+#   这个仓库是「会学习的长期记忆系统」的**实现**，不是某个人记忆内容的备份。
+#   知识页（repos/*/pages/*.md）里全是真实的个人数据（偏好、环境、故障、待办、
+#   会话记录），发布出去等于公开日记 —— 所以它们被整体排除，靠「首次运行自动生成」。
+#
+# ⚠️ 新增文件前先问一句：这是「系统的代码」还是「我的记忆」？前者进，后者不进。
+# ============================================================================
+
+# ---------- 个人记忆数据（整体排除） ----------
+# 每个仓库一套银行，里面是知识页 + 流水 + 反思 + 索引：全是个人内容
+repos/
+# 会话日志原件（多帧 zstd，几百 MB，且含全部对话原文）
+sessions/
+# 会话摘要
+digest/
+# 工作区快照 / 运行时状态 / 实时会话心跳 / 备份 / 导出 / issue 稿
+state/
+live/
+backup/
+exports/
+issues/
+
+# ---------- 旧版记忆库的个人内容 ----------
+# 这些是「某个人的记忆正文」，不是系统的实现
+MEMORY.md
+MEMORY.md.bak-*
+STATUS.md
+INDEX.md
+dream-*.md
+迁移到新电脑.md
+
+# ---------- 个人工作痕迹 ----------
+# 跟踪的 GitHub issue/PR 列表（含具体仓库与编号）
+watch.json
+# 运行时缓存与本地环境快照
+.bg.json
+*.log
+
+# ---------- 个人专用工具（不是系统实现，是「我这台机器上干这活」的脚本） ----------
+# 判定标准（2026-11-08 逐文件扫过）：① 真读凭证文件 ② 硬编码本机用户目录 ③ 个人账号/一次性脚本
+# ①类：读 .credentials.yaml 的工具 —— 发布等于公开凭证读取路径
+tools/img-400-probe.mjs
+tools/syn-bake.mjs
+tools/relay-speedtest.py
+# ②③类：个人账号查询 / 一次性拆分与回滚 / 依赖上面产物的转换脚本
+tools/gh-my-posts.mjs
+tools/gh-my-posts.ps1
+tools/my-posts.html
+tools/bank-split.mjs
+tools/undo_rename.mjs
+tools/undo_tidy.mjs
+tools/syn-to-json.mjs
+# 个人学习资料的生成器（速查表 / 练习归档）—— 依赖用户的私有素材目录
+tools/cheatsheet-build.mjs
+tools/archive_practice.mjs
+# 同义词烘焙的**产物**（是由上面的个人工具从我自己的语料生成的，属数据不属代码）
+tools/syn-baked.json
+
+# ---------- 二进制与备份（绝不入库） ----------
+# Node 运行时副本（为了解决 hook 里 node 命令失效而放的，90+ MB）
+bank/hooks/node.exe
+*.exe
+# 所有手工备份：xxx.mjs.bak-20261031-111120 这类
+*.bak-*
+*.bak
+# 备份目录
+_bak/
+bank/_bak-*/
+tools/_bak/
+# 下划线开头的临时探针脚本（开发期验证用，默认参数写死了自己的 slug）
+bank/_*.mjs
+tools/_*.mjs
+
+# ---------- 系统与编辑器杂项 ----------
+Thumbs.db
+desktop.ini
+.DS_Store
+*.swp
+
+# ---------- 依赖（本项目零依赖，理论上不该出现） ----------
+node_modules/

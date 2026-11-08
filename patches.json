@@ -1,0 +1,42 @@
+{
+  "_readme": "外挂补丁清单（单一数据源）—— 由 tools/patch-dsh-empty-response.mjs（应用）与 bank/patch-status.mjs（复查）**共同读取**，避免锚点串在两处各写一份而漂移（同族教训：配置键三处同步）。",
+  "_why": "补丁写在【DSH 应用安装目录】里 ⇒ ① 升级/重装即被覆盖 ② 不重启不生效，而**两种情况都不报错** ⇒ 必须能被定期复查（`cli sweep` ⑥ 段）。",
+  "_anchor_rule": "oldLine / newLine 都是【行内子串】，**刻意不含行首缩进** —— 替换不动缩进，也不会因 tab/空格差异匹配失败。锚点必须唯一命中，否则脚本拒绝写入。",
+  "_retired_note": "2026-09-19：两条内核补丁**已撤**（`--restore`），这一层改由插件承担。理由：① 补丁写在应用安装目录，**DSH 每次升级都会被覆盖**（这正是 ⑥ 段存在的意义）；② 社区已有对症插件，且它挂在 `llm/stream` 瀑布流 ⇒ **一个挂载点覆盖全部 adapter**（含 pi-ai），不必逐 adapter 打补丁。条目**保留不删**（可审计；万一插件失效，`--apply` 随时能打回来），但自检会**跳过 retired 项**、改查 `guardPlugins`。",
+  "_updated": "2026-09-19",
+  "patches": [
+    {
+      "id": "deepseek-empty-response",
+      "title": "空回复判据（只有 reasoning ⇒ EMPTY_RESPONSE ⇒ 自动重试）",
+      "pkg": "dsh-llm-deepseek",
+      "rel": "node_modules/@deepseek-ai/dsh-llm-deepseek/lib/index.js",
+      "oldLine": "reason: reason.kind === \"stop\" && order.length === 0 ? {",
+      "newLine": "reason: reason.kind === \"stop\" && !order.some((block) => block.kind === \"tool-call\" || (block.kind === \"text\" && block.text.trim())) ? {",
+      "note": "order 里的块形状是 {index, kind, text}（见 translate() 的 open(kind)，kind ∈ text|reasoning|tool-call）—— 2026-09-18 读源码确认，故判据用 block.kind 是对的。",
+      "retired": true,
+      "retiredWhy": "已由 @argszero/cordis-plugin-empty-response-guard 承担（它挂 llm/stream，覆盖全部 adapter 且不怕升级覆盖）。上游复核也确认：**不要**改用 assistantStreamHasVisibleContent —— 那个 helper 把推理算作可见内容，对本形状恒为 true。"
+    },
+    {
+      "id": "pi-ai-empty-response",
+      "title": "空回复判据（pi-ai 适配器：只有 thinking 时同样被判成功）",
+      "pkg": "dsh-llm-pi-ai",
+      "rel": "node_modules/@deepseek-ai/dsh-llm-pi-ai/lib/index.js",
+      "oldLine": "if (message.content.length === 0) return {",
+      "newLine": "if (!message.content.some((block) => block.type === \"toolCall\" || block.type === \"tool-call\" || (block.type === \"text\" && typeof block.text === \"string\" && block.text.trim()))) return {",
+      "note": "判据必须**同时认两种类型名**：走 pi-ai 原生 message 时思考块是 thinking、工具块是 toolCall；而 completeTerminalMessage() 从流块恢复时用的是 DSH 风格 tool-call/reasoning。原判据只看「块数为 0」，只要有思考块就 ≥1 ⇒ 判 stop ⇒ 静默空回复。",
+      "retired": true,
+      "retiredWhy": "同上 —— 插件在 llm/stream 上一次性覆盖两个 adapter。**但**这个 adapter 自己的谓词修复仍是正确的上游修法（保证没挂插件时也分类正确）。"
+    }
+  ],
+  "guardPlugins": [
+    {
+      "name": "@argszero/cordis-plugin-empty-response-guard",
+      "why": "把「reasoning-only 完成」重分类为 EMPTY_RESPONSE（discussion #6218 = 我们的形状）；另治 usage 0/0/0 的 stop（#6948，报为 TRANSPORT）。默认 mode='error'、无需配置。",
+      "replaces": ["deepseek-empty-response", "pi-ai-empty-response"]
+    },
+    {
+      "name": "@argszero/cordis-plugin-thinking-loop-guard",
+      "why": "跨步形态：连续 N 步「无可见产出」或「重复上一步材料」⇒ warn/steer（抓「带正文的重推」，单条判据与内核补丁都看不见）。参数按我们 21 个会话实测选定：minReasoningChars 512 / repeatRatio 0.7 / escalate warn。"
+    }
+  ]
+}

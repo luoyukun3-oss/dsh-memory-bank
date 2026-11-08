@@ -1,0 +1,12 @@
+{
+  "name": "dsh-memory-bank-hooks",
+  "version": "1.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Memory Bank 钩子桥接包装包（官方桌面版 0.2 用）：把 @deepseek-ai/dsh-hooks-claude-code 以 bundle 层挂载，并注入 configPath。不声明依赖 —— 官方桌面版的本体包走 runtime resolution，从内置 runtime 解析到 0.2.0-rc.2。",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

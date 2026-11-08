@@ -1,0 +1,60 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "& \"E:\\2\\_dsh_memory\\bank\\hooks\\node-run.cmd\" \"E:\\2\\_dsh_memory\\bank\\hooks\\session-start.mjs\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "& \"E:\\2\\_dsh_memory\\bank\\hooks\\node-run.cmd\" \"E:\\2\\_dsh_memory\\bank\\hooks\\user-prompt.mjs\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "[Pp]wsh|[Bb]ash|[Ss]hell|[Ee]xec",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "& \"E:\\2\\_dsh_memory\\bank\\hooks\\node-run.cmd\" \"E:\\2\\_dsh_memory\\bank\\hooks\\pre-tool.mjs\"",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "[Ww]rite|[Ee]dit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "& \"E:\\2\\_dsh_memory\\bank\\hooks\\node-run.cmd\" \"E:\\2\\_dsh_memory\\bank\\hooks\\post-write.mjs\"",
+            "timeout": 15
+          }
+        ]
+      },
+      {
+        "matcher": "[Rr]ead|[Bb]ash|[Gg]rep|[Gg]lob",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "& \"E:\\2\\_dsh_memory\\bank\\hooks\\node-run.cmd\" \"E:\\2\\_dsh_memory\\bank\\hooks\\post-tool.mjs\"",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}
