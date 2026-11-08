@@ -19,13 +19,21 @@ const TODOS = path.join(REPO, 'pages', 'todos.md');
 const TOOL = path.join(MEM, 'tools', 'page-toc.mjs');
 const CLI = path.join(HERE, 'cli.mjs');
 
-let pass = 0, fail = 0;
+// ⚠️ 2026-11-08 发布适配：`repos/` 是**个人记忆数据，不进仓库**（见 .gitignore）。
+//    所以 clone 下来的人没有 `repos/e-2` —— 先前这里直接 readFileSync 会 ENOENT 崩掉整个测试。
+//    现在：依赖真实库的那几节在没有本地银行时**显式跳过并单独计数**（不虚报成"通过"）。
+const hasLocal = fs.existsSync(TODOS);
+
+let pass = 0, fail = 0, skip = 0;
 const ok = (cond, msg, extra = '') => {
   if (cond) { pass++; console.log('  [OK] ' + msg); } else { fail++; console.log('  [!!] ' + msg + (extra ? '  -> ' + extra : '')); }
 };
+const skipped = (msg) => { skip++; console.log('  [SKIP] ' + msg + '（需要本地银行 repos/e-2，发布版不含个人记忆）'); };
 
 console.log('== T1. page-toc 幂等（再跑一次应报「最新/无需改动」）==');
-{
+if (!hasLocal) {
+  skipped('T1 page-toc 幂等（检查的是本地三个知识页的目录）');
+} else {
   const r = spawnSync(process.execPath, [TOOL, '--check', '--all'], { encoding: 'utf8' });
   const out = String(r.stdout || '');
   ok(r.status === 0, 'page-toc --check 正常退出', 'exit=' + r.status);
@@ -33,7 +41,9 @@ console.log('== T1. page-toc 幂等（再跑一次应报「最新/无需改动�
 }
 
 console.log('== T2. TOC 里的行号 = 正文真实行号 ==');
-{
+if (!hasLocal) {
+  skipped('T2 TOC 行号核对（要读真实 todos.md）');
+} else {
   const lines = fs.readFileSync(TODOS, 'utf8').split('\n');
   const b = lines.findIndex((l) => /TOC:BEGIN/.test(l));
   const e = lines.findIndex((l) => /TOC:END/.test(l));
@@ -51,7 +61,9 @@ console.log('== T2. TOC 里的行号 = 正文真实行号 ==');
 }
 
 console.log('== T3. 注入只出「目录 + 定时条目」，不出长正文 ==');
-{
+if (!hasLocal) {
+  skipped('T3 待办注入形态（要读真实 todos.md）');
+} else {
   const text = fs.readFileSync(TODOS, 'utf8');
   const injected = indexList(text);
   ok(injected.length > 0, '待办注入非空');
@@ -82,12 +94,14 @@ console.log('== T5. splitItems：独立 --- 不归属任何条目 ==');
 }
 
 console.log('== T6. 注入总量不超总预算 ==');
-{
+if (!hasLocal) {
+  skipped('T6 注入总预算（要跑 cli preview，它依赖本地银行）');
+} else {
   const r = spawnSync(process.execPath, [CLI, 'preview'], { encoding: 'utf8' });
   const m = /（(\d+)\s*字）/.exec(String(r.stdout || ''));
   const n = m ? Number(m[1]) : 0;
   ok(n > 0 && n <= INJECT_BUDGET, `注入总量 ${n} ≤ 预算 ${INJECT_BUDGET}`, '解析到 ' + n);
 }
 
-console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
+console.log(`\n结果：${pass} 通过 / ${fail} 失败` + (skip ? ` / ${skip} 跳过（无本地银行）` : ''));
 if (fail > 0) process.exit(1);

@@ -66,7 +66,7 @@
     "bank/reflect.mjs": 220,
     "bank/reflect-neg.mjs": 75,
     "bank/cli.mjs": 510,
-    "bank/test.mjs": 440,
+    "bank/test.mjs": 460,
     "bank/text-guards.mjs": 40,
     "bank/text-clean.mjs": 50,
     "bank/assoc.mjs": 120,
@@ -106,6 +106,7 @@
     "bank/live.mjs": 190,
     "bank/inject-index.mjs": 150,
     "bank/test-toc.mjs": 110,
+    "bank/test-fixture.mjs": 250,
     "tools/read-thread.mjs": 150,
     "tools/migrate-install.mjs": 200,
     "tools/archive_practice.mjs": 100,
@@ -164,5 +165,6 @@
   "_rebudget_note_20261023": "第三十七轮（10-23 下午·主人拍板「把tick改了吧」）：**新增 bank/commands/tick.mjs（实测待校准 → 预算 160）**，并改造 tick 的三处调度。① **按域拆**：cli.mjs 489/510（96%）⇒ 把 tick 主流程整段搬到 commands/tick.mjs（先例 commands/mood.mjs / commands/dream-inbox.mjs），cli.mjs 489 → 457（90%），预算 510 **不动**（实测下降不放松警戒线）。② **每段 step() 封装**（计时 + try/catch）：原实现 ingest/handoff/reflect/tidy/sweep/sync/dream 全裸调用，前一段抛错后面全不跑；现在失败只记进 marks，汇总行多一行 `[分段]` 打印每段耗时与失败原因。③ **两处频率闸**：sweep 带 stamp（55 分钟内跳过）、handoff 带 stamp（候选签名 = 前 3 个会话日志的 文件名:size:mtime 未变就跳过整段解压）。④ **sweep 的重复检测加精确剪枝**：原来 O(n²) 在 1102 条文档上实测 **8.75 秒**（sweep 全程 14.7 秒的大头），剪枝依据 `J ≤ min/max` 这个恒等式 —— 两边 token 数差超 1.25 倍的对必然 J < 0.8，可整对跳过、**零漏检**。⑤ 测试同步：test-mechanisms 第 18 节那条「tick 汇总行带主干同步状态」的断言改成读 commands/tick.mjs（主流程搬家了）。⚠️ 逐段实测基线（10-23）：ingest 6.3s / handoff 5.4s / reflect 2.2s / tidy 0.4s / sweep 14.7s / sync 0.26s / page-toc 0.24s / dream 0.48s / dream-inbox 0.26s / legacy 104s，tick 整体 20 秒/次、每 30 分钟一次。",
   "_rebudget_note_20261023b": "第三十八轮（10-23 傍晚）：**dream.mjs 190 → 220**（实测 199 × 1.1）。这是**功能增加**而非压缩行宽：新增 `since` 档 —— `cli dream --since <日期>` 只报「任一端条目日期 ≥ 该日」的候选，供每日 19:30 扫当天用（主人提议「扫一下今天，事件可以链接的」）。判据与已有的 same-event 分层**刻意分开**：near 档看「两端日期差小」（历史累积的同日对），since 看「至少一端是新的」（今天新写的东西跟谁有关），两者回答的不是同一个问题。日期复用 `dateOf`（正文前 300 字抽 20xx-xx-xx），与 dayGap 同源。⚠️ 按规矩「超限先按域拆」本应拆出 `formatDreamReport`，但它只占 ~20 行、拆了要动调用方与 test，本轮判断**校准预算更划算**；若下次再动这个文件，先拆格式化那一层。另：本轮 `cue.mjs` 开了个小口子（memo.md 允许进 cue 表，仍不进召回），预算 220→240。",
   "_rebudget_note_20261026": "第四十轮（10-26 晚）：按域拆出 **bank/cue-render.mjs**（实测 111 → 预算 130）与 **bank/hooks/self-state.mjs**（实测 92 → 预算 110）。起因是主人一句「你的推理架构不是正好解决这个名额问题」—— 顺藤查出 cue 的「2 条名额」是**假的**：每条「标题 44 + 正文 180」≈224 字，而 `CUE_BUDGET` 只有 240 ⇒ 实测第 2 条永远进不来、第 1 条还被砍在「**修法」二字之前（用真实提问回放取证，非推测）。改法不是加预算，而是**两级注入**：`CUE_MAX_HITS` 2→8（候选扫描）、`CUE_BODY_HITS=1`（只有概率最高的那条给正文）、`CUE_MAX_ROADS=4`（其余只给 page｜标题路牌，要不要拉详情由推理自己判断）；`CUE_BUDGET` 240→320 并用硬切保证不超。概率 = √词长 × idf × 重要度 × 重复次数（确定性，不采样）。⚠️ 同时把 commands/tick.mjs 160 → 190（实测 171 × 1.1）：那 11 行是 10-26 早些时候加的 energy/ev 两段，**不是本轮造成的**，按本表「实测 × 1.1 校准」办；该文件下次动之前应先拆。",
-  "_rebudget_note_20261103": "第四十轮（11-02 晚）：**事实键落地** —— 新增 bank/factkey.mjs（实测 79 → 预算 90）+ bank/commands/remember.mjs（实测 98 → 预算 110）。**为什么拆而不是塞**：cli.mjs 实测 480/510（94%），本轮要加 --key/--dry 两个分支，直接塞会到 98% —— 按本表 `_principle`「超限先按域拆、不准压缩行宽硬塞」，把整个 remember 域搬到 commands/（先例：10-13 mood、10-26 ev）。搬完 cli.mjs 480→447（88%），**预算不动**（本表规矩：实测下降不放松警戒线）。**机制**：`supersededBy` 早已存在且生效（search ×0.25 降权、assoc/cue 直接跳过），但从来没有**建立**关系的入口 ⇒ 等于空转。现在 `remember --key 对象.方面` 写入时自动扫同页同键旧条、给它们追加 `sup:` 注释（只改 meta 不删内容）。**键里不许写值**（`她.身高` 不是 `她.身高170`）—— 值一变化键就变，新旧两条永远碰不上，这是 fish-memory 的原话教训。**测试**：test-factkey.mjs 20 条断言（键形状 6 / 块定位 4 / 标记行为 5 / 幂等与人工保护 5），接线到 test.mjs 第 23 节，**全量 324 通过 / 0 失败**。"
+  "_rebudget_note_20261103": "第四十轮（11-02 晚）：**事实键落地** —— 新增 bank/factkey.mjs（实测 79 → 预算 90）+ bank/commands/remember.mjs（实测 98 → 预算 110）。**为什么拆而不是塞**：cli.mjs 实测 480/510（94%），本轮要加 --key/--dry 两个分支，直接塞会到 98% —— 按本表 `_principle`「超限先按域拆、不准压缩行宽硬塞」，把整个 remember 域搬到 commands/（先例：10-13 mood、10-26 ev）。搬完 cli.mjs 480→447（88%），**预算不动**（本表规矩：实测下降不放松警戒线）。**机制**：`supersededBy` 早已存在且生效（search ×0.25 降权、assoc/cue 直接跳过），但从来没有**建立**关系的入口 ⇒ 等于空转。现在 `remember --key 对象.方面` 写入时自动扫同页同键旧条、给它们追加 `sup:` 注释（只改 meta 不删内容）。**键里不许写值**（`她.身高` 不是 `她.身高170`）—— 值一变化键就变，新旧两条永远碰不上，这是 fish-memory 的原话教训。**测试**：test-factkey.mjs 20 条断言（键形状 6 / 块定位 4 / 标记行为 5 / 幂等与人工保护 5），接线到 test.mjs 第 23 节，**全量 324 通过 / 0 失败**。",
+  "_rebudget_note_20261108": "第四十一轮（11-08 发布适配）：**新增 bank/test-fixture.mjs（实测 224 行 → 预算 250）** —— clone 下来的人没有 repos/（个人记忆不进仓库），而 test.mjs 有 33 处断言依赖真实库；早年做法是跳过，但**跳过等于放弃覆盖**。现在改成「没有真库就自建夹具库」（内容自己编、结构等价：别名分组/表格行/i 元数据/TOC/定时条目/归档页/流水），于是同一套断言在任何人机器上都能真跑（实测 clean clone：343 通过 / 0 失败 / 5 跳过）。**test.mjs 440 → 460**：加的是发布适配（夹具接线 + 行数检查的「未入库跳过」），属功能增加而非压缩行宽，按实测 ×1.1 校准。⚠️ 顺带修掉一个真缺陷：行数检查原先 !row.missing 直接判红，导致开源版对 5 个「个人专用工具不入库」报假红。"
 }

@@ -23,12 +23,15 @@ import { runTranscriptTests } from './test-transcripts.mjs';
 import { runFactKeyTests } from './test-factkey.mjs';   // 事实键（2026-11-02）   // 多根会话发现（2026-10-29 接线：文件早就在，只是没被 import 过）
 import { runLessonsAuditTests } from './test-lessons-audit.mjs';   // 哑弹审计键错位（2026-11-08）
 import { runHandoffThinTests } from './test-handoff-thin.mjs';     // handoff 空泛小结降级（2026-11-08）
+import { ensureFixtureBank, FIXTURE } from './test-fixture.mjs';   // 夹具银行（2026-11-08：clone 下来也能跑全测试）
 
-let pass = 0, fail = 0;
+let pass = 0, fail = 0, skip = 0;
 const ok = (cond, name, extra = '') => {
   if (cond) { pass++; console.log(`  [OK] ${name}`); }
   else { fail++; console.log(`  [!!] ${name}${extra ? '  -> ' + extra : ''}`); }
 };
+/** 跳过计数：只在「该项在本环境不适用」时用（未入库的个人工具、无本地银行），**不虚报成通过**。 */
+const skipped = (name) => { skip++; console.log(`  [SKIP] ${name}`); };
 
 console.log('== 1. 元数据解析 ==');
 const a = parseMeta('- 条目 <!-- i:5 s:user c:low x:2020-01-01 sup:被新版取代 -->');
@@ -39,7 +42,13 @@ const b = parseMeta('<!-- i:1-5 s:user|probe|infer c:high|mid|low x:YYYY-MM-DD -
 ok(Object.keys(b.meta).length === 0, '白名单挡住说明行里的示例注释', JSON.stringify(b.meta));
 
 console.log('== 2. 别名表 ==');
-const real = repoDir('e-2');
+// ⚠️ 2026-11-08 发布适配：`repos/` 是个人记忆数据、不进仓库 ⇒ clone 下来没有 `repos/e-2`。
+//    早年遇到这种情况是"跳过"，但那等于放弃 15 节 / 33 条断言。现在改成：**没有真库就自建夹具库**
+//    （`test-fixture.mjs`：内容自己编、结构等价），于是同一套断言在任何人机器上都能真跑。
+const localReal = repoDir('e-2');
+const hasLocalBank = fs.existsSync(path.join(localReal, 'index.json'));
+const real = hasLocalBank ? localReal : ensureFixtureBank();
+if (!hasLocalBank) console.log(`  （本地无 e-2 银行 —— 改用夹具库 ${FIXTURE}，断言照样执行）`);
 const groups = loadAliases(real);
 ok(groups.length >= 20, `加载 ${groups.length} 组别名`);
 ok(groups.some((g) => g.some((w) => w.includes('卡顿'))), '含「卡顿」组');
@@ -266,10 +275,14 @@ const memRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));   //
 const bud = checkLineBudgets(memRoot);
 ok(bud.rows.length >= 5, `预算表覆盖 ${bud.rows.length} 个文件`);
 for (const row of bud.rows) {
+  // ⚠️ 2026-11-08 发布适配：预算表里登记的一些文件是**个人专用工具**（读凭证的、一次性脚本），
+  //    按 .gitignore 不进仓库 ⇒ clone 下来它们"不存在"，这**不是超限也不是丢文件**。
+  //    早先 `!row.missing` 直接判红，导致开源版测试 5 条假红。现在：缺失 ⇒ 跳过（单独计数）。
+  if (row.missing) { skipped(`${row.file}（未入库，跳过行数检查）`); continue; }
   ok(
-    !row.missing && !row.over,
-    `${row.file} 在预算内（${row.lines ?? '缺失'} / ${row.budget}）`,
-    row.missing ? '文件不存在' : `超限 ${row.lines - row.budget} 行 —— 先按域拆分，别压缩行宽`,
+    !row.over,
+    `${row.file} 在预算内（${row.lines} / ${row.budget}）`,
+    `超限 ${row.lines - row.budget} 行 —— 先按域拆分，别压缩行宽`,
   );
 }
 
@@ -418,7 +431,7 @@ runAssocTests({ ok, real });                // 第 21 节：联想扩散的不�
 runTranscriptTests({ ok });                  // 第 22 节：findTranscripts 多根合并（2026-10-29 接线，此前是孤儿测试）
 runLessonsAuditTests({ ok });                // 第 27 节：哑弹审计的键口径（2026-11-08 修 192 条假阳性）
 runHandoffThinTests({ ok });                 // 第 3g 节：handoff 空泛小结降级（2026-11-08）
-console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
+console.log(`\n结果：${pass} 通过 / ${fail} 失败` + (skip ? ` / ${skip} 跳过（本环境不适用）` : ''));
 
 process.exitCode = fail ? 1 : 0;
 
