@@ -155,6 +155,14 @@ for (const c of CLUSTER_DEF) {
   out.push('');
 }
 
+// ⚠️ 这一行必须放在「连线」之前 —— 原文件里它在 L806、LINKS 生成在 L897（定义在前）。
+//    2026-11-08 实测踩过：我一开始把它追加到数据段**末尾**，浏览器报
+//    `Cannot access 'clusterById' before initialization`（TDZ）——`const` 在声明前不可用，
+//    而 LINKS 那段就在它前面。**插入派生代码要看依赖顺序，不能图省事往末尾加。**
+out.push('');
+out.push('const clusterById = Object.fromEntries(CLUSTERS.map(c => [c.id, c]));');
+out.push('');
+
 // 连线：核心 → 各星团锚点、锚点 → 各节点
 out.push('/* 连线 */');
 out.push('const LINKS = [];');
@@ -185,11 +193,6 @@ for (const d of days) {
   out.push(`  '${d}': { has: ${cnt > 0 ? 1 : 0}, dens: ${Math.min(.95, .15 + cnt / 100).toFixed(2)}, note: '${cnt} 条' },`);
 }
 out.push('};');
-
-// ⚠️ 这一行原文件在数据段中间（L806），切模板时会被一起切掉，但它**不是数据**、
-//    而是「CLUSTERS → 渲染代码」的桥接（LINKS 生成与多处渲染都要它）⇒ 必须由生成器补回。
-out.push('');
-out.push('const clusterById = Object.fromEntries(CLUSTERS.map(c => [c.id, c]));');
 
 // —— 套模板 ——
 const tplPath = path.join(HERE, 'star-map-template.html');
