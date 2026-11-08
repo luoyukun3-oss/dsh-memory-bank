@@ -1,10 +1,23 @@
-# Memory Bank 钩子层（bundle 层 patch）
+# ============================================================================
+# Memory Bank 钩子层（bundle 层 patch）—— ★ 这是**模板**，用前必须改下面两个路径
+#
 # 由 dsh-memory-bank-hooks 包提供。
-# 关键：新增条目必须写在 `insert:` 下面（平铺写法会被当作"覆盖已存在条目"而报 entry not found）
+#
+# ⚠️ 关键：新增条目必须写在 `insert:` 下面 —— 平铺写法会被当作"覆盖已存在条目"，
+#    报 `patch: entry "xxx" not found`（用户层只能覆盖/禁用已有 id，不能新增插件）。
+#
+# ⚠️ 必须改成**绝对路径**，且路径里**不能有空格**（DSH 的模块解析会在这上面栽跟头）。
+#    · configPath  → <你的记忆库>/bank/hooks/hooks.json
+#    · projectDir  → 你的工作区根目录（记忆库按它的 slug 隔离）
+#
+# ⚠️ 部署位置有硬要求：这个包必须放在 **profile 内部**
+#    （`profiles/web/.local-bundles/dsh-memory-bank-hooks/`）。放外面再 link 进去，
+#    DSH 按拥有者包的真实路径向上找 node_modules 会失败 ⇒ 插件**静默不加载、不报错**。
+# ============================================================================
 - insert:
     - id: mem-bank-hooks
       name: '@deepseek-ai/dsh-hooks-claude-code'
       config:
-        configPath: E:/2/_dsh_memory/bank/hooks/hooks.json
-        projectDir: E:/2
+        configPath: '<改成你的绝对路径>/bank/hooks/hooks.json'
+        projectDir: '<改成你的工作区绝对路径>'
         defaultTimeoutMs: 30000

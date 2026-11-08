@@ -4,12 +4,13 @@
   "private": true,
   "type": "module",
   "description": "Memory Bank 钩子桥接包装包：把 @deepseek-ai/dsh-hooks-claude-code 以 bundle 层挂载，并注入 configPath",
+  "_note": "★ 这是模板。① `cordis.patch.yml` 里的 configPath / projectDir 必须改成你自己的绝对路径；② 本包必须放在 profile 内部（profiles/web/.local-bundles/dsh-memory-bank-hooks/），放外面再 link 进去会导致插件静默不加载。",
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
     }
   },
   "dependencies": {
-    "@deepseek-ai/dsh-hooks-claude-code": "link:E:/dsh-hooks-bridge"
+    "@deepseek-ai/dsh-hooks-claude-code": "^0.0.1-rc.5"
   }
 }

@@ -46,8 +46,15 @@ DSH 的 `dsh-agent-instructions` 插件会在每个新会话的第一次请求�
 
 ## 日常怎么用
 
-1. **想让助手记住新的事**：对它说「更新记忆」，它会改写 `MEMORY.md`；
-2. **新会话想恢复上下文**：说「先读 `_dsh_memory/MEMORY.md`」即可（`AGENTS.md` 里也写了这条提示）；
+> ⚠️ 前两条以前要**手动触发**，现在都是**自动挡**（记忆银行挂了 hook）。留删除线是为了看得出改过什么。
+
+1. ~~**想让助手记住新的事**：对它说「更新记忆」，它会改写 `MEMORY.md`~~
+   —— **不用说了**：`UserPromptSubmit` hook 每轮会**后台自动增量摄入**（限流 90 秒一次），
+   另有计划任务每 30 分钟兜底（hook 被沙箱拒时仍保证落盘）。你正常聊天就行，
+   想更快看见就 `node bank/cli.mjs ingest` 手动催一次（幂等，不会重复记）。
+2. ~~**新会话想恢复上下文**：说「先读 `_dsh_memory/MEMORY.md`」即可~~
+   —— **也不用说了**：`SessionStart` hook 开场自动注入 13 段摘要（含待办、近期事件、决策、教训索引…）。
+   想确认到底注入了什么，跑 `node bank/cli.mjs preview`。
 3. **备份会话日志**：`node E:\2\_dsh_memory\backup_sessions.mjs`
 4. **查看某次会话的原文**：
    ```
