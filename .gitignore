@@ -59,6 +59,31 @@ tools/archive_practice.mjs
 # 同义词烘焙的**产物**（是由上面的个人工具从我自己的语料生成的，属数据不属代码）
 tools/syn-baked.json
 
+# ---------- 与本项目无关的工具（2026-11-08 内容审计后清出） ----------
+# 判据：打开文件问一句「它在记忆系统里承担什么角色？」—— 答不出就是无关。
+# ⚠️ 注意：`.gitignore` **不支持行尾注释** —— 行内的 `#` 会成为模式的一部分、导致规则失效
+#    （2026-11-08 踩过：写成 `tools/bill.mjs  # 账单` 后 `git check-ignore` 报未匹配，
+#     `git add .` 又把文件加了回来）。所以注释一律写在**上一行**。
+# PPT 转单文件 HTML
+tools/pptx2html.py
+# 把资源管理器窗口提到前台（解 DSH 窗口遮挡）
+tools/show-explorer.ps1
+# Windows 自带 OCR
+tools/win-ocr.ps1
+# DeepSeek API 账单核算
+tools/bill.mjs
+# 读 GitHub Discussion 全部评论
+tools/read-thread.mjs
+# ⚠️ import 路径写错，装好就跑不起来（实测 ERR_MODULE_NOT_FOUND）
+tools/probe-query.mjs
+# 已删文件的残留（功能早被 page-toc.mjs 取代，文件名带 .removed-<日期>）
+tools/*.removed-*
+
+# ---------- 开发日志（不是产品文档，不随仓库分发） ----------
+# 行数预算的历次校准记录：回答「为什么某个文件的预算是这个数」。
+# 对使用者无用（他们只需要当前生效的预算表），且含大量个人历史 ⇒ 留在本地。
+bank/budgets-history.md
+
 # ---------- 二进制与备份（绝不入库） ----------
 # Node 运行时副本（为了解决 hook 里 node 命令失效而放的，90+ MB）
 bank/hooks/node.exe

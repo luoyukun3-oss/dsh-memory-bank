@@ -6,9 +6,12 @@ rem Resolution order:
 rem   1. %~dp0node.exe -- a HARD LINK to the real node.exe of the shell
 rem      that currently runs DSH. No path guessing, pure ASCII path.
 rem      Rebuild after switching shells:
-rem        cmd /c mklink /H "E:\2\_dsh_memory\bank\hooks\node.exe" "<shell>\resources\runtime\primary-runtime\dependencies\node\bin\node.exe"
+rem        cmd /c mklink /H "<this dir>\node.exe" "<shell>\resources\runtime\primary-runtime\dependencies\node\bin\node.exe"
+rem      NOTE: node.exe is NOT committed (see .gitignore) -- it is a machine-local
+rem      hard link, so a fresh clone will fall through to the candidates below.
 rem   2. %DSH_DESKTOP_NODE_EXECUTABLE% -- env var some shells export.
-rem   3. Known absolute installs (kept for older shells).
+rem   3. %DSH_NODE_B% -- optional override for any other install location.
+rem      (Was hard-coded to the author's own install path before 2026-11-08.)
 rem   4. Whatever PATH resolves.
 rem
 rem 2026-10-23 incident: moving to DeepSeek Harness Desktop 0.2.1-rc.2
@@ -41,10 +44,12 @@ if exist "%NODE_A%" (
   exit /b %errorlevel%
 )
 
-set "NODE_B=E:\3\DSH Desktop\resources\app\node_modules\node\bin\node.exe"
-if exist "%NODE_B%" (
-  "%NODE_B%" %*
-  exit /b %errorlevel%
+rem Optional override: set DSH_NODE_B to any node.exe you want to prefer.
+if defined DSH_NODE_B (
+  if exist "%DSH_NODE_B%" (
+    "%DSH_NODE_B%" %*
+    exit /b %errorlevel%
+  )
 )
 
 set "NODE_C=%ProgramFiles%\nodejs\node.exe"
