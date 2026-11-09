@@ -3,8 +3,9 @@
 //   —— 三个零依赖纯函数：`tocInject`（TOC 块 + 定时条目）、`indexList`（待办逐条索引）、
 //      `lessonIndex`（教训按节索引）。拆出的动因：bootstrap.mjs 被顶到 380/390 = 97%，
 //      按「只许瘦不许胖：超限先按域拆分，别压缩行宽硬塞」的规矩处理，不靠删注释硬塞。
-//   ⚠️ 本文件不许 import bank.mjs（会循环依赖）；目前只依赖 node 标准库。
+//   ⚠️ 本文件不许 import bank.mjs（会循环依赖）；目前只依赖 node 标准库 + ./toc-merge.mjs。
 // ============================================================================
+import { mergeTocSections } from './toc-merge.mjs';   // 纲目体·资格门（2026-11-08 按域拆出）
 
 /** 待办 TOC 注入（2026-10-05 用户定）：文件顶部有 TOC 块时，注入只出「目录 + 定时条目完整行」。
  *  非定时待办是给人看的（面板），只有定时条目需要 agent 到点执行 —— 实测 1618 → 约 540 字。
@@ -24,8 +25,10 @@ export function tocInject(src, maxLen) {
     timed.push(m[2].length > maxLen ? m[2].slice(0, maxLen) + '…' : m[2]);
   }
   const head = '⏰ 定时条目（到点自动派发，故给完整原文）：';
-  return toc.join('\n') + (timed.length ? '\n' + head + '\n' + timed.map((x) => '- ' + x).join('\n') : '');
+  const merged = mergeTocSections(toc);
+  return merged.join('\n') + (timed.length ? '\n' + head + '\n' + timed.map((x) => '- ' + x).join('\n') : '');
 }
+
 
 
 // 索引式清单：待办每条压成一行（跳过已完成），按 ## 分节输出
@@ -84,11 +87,21 @@ export function indexList(text, { maxItems = 60, maxLen = 170, skipDone = true }
 
 
 
-export function lessonIndex(text, { maxLen = 40, recent = 3 } = {}) {
+/** 注入端 TOC 瘦身（2026-11-09）：lessons.md 的 TOC 每节列「最近 3 条」≈ 980 字（注入 13%），而第 3 条
+ *  基本没人读 ⇒ 只留 keep 条。⚠️ 只剥**行尾整条**（判据：行尾 ` L<行号>`），标题里也含 ` · `，不能瞎切。 */
+const slimToc = (toc, keep) => String(toc).split('\n').map((line) => {
+  let s = line;
+  while ((s.match(/\sL\d+/g) || []).length > keep) {
+    const at = s.lastIndexOf(' · '); if (at < 0) break; s = s.slice(0, at);
+  }
+  return s.replace(/最近\s*3\s*条/g, `最近 ${keep} 条`);   // 说明行同步改，免自相矛盾
+}).join('\n');
+
+export function lessonIndex(text, { maxLen = 40, recent = 1 } = {}) {
   // TOC 优先（2026-10-05）：lessons.md 顶部有 page-toc.mjs 生成的目录块时直接用它
   // —— 每节带条数 + 最近几条 + **正文行号**，实测 1306 → 852 字，且可按行号直接 read。
   const toc = tocInject(String(text || ''), maxLen);
-  if (toc) return toc;
+  if (toc) return slimToc(toc, recent);
   const groups = [];
   let cur = '';
   for (const raw of String(text || '').split('\n')) {

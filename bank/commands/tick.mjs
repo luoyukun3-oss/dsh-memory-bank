@@ -22,7 +22,7 @@
 //    （opt / dir / cwd / log）。
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 // ⚠️ 依赖方向照 cli.mjs 原样：**聚合层 bank.mjs 只提供通用能力**，dream / handoff / day-split
 //   这三个域模块各自直连 —— 它们没被 bank.mjs re-export（2026-10-23 第一次写时栽在这：
@@ -35,6 +35,9 @@ import { ingestCandidates } from '../dream-inbox.mjs';
 import { writeDaySplit } from './day-split.mjs';
 import { tickEnergy } from '../mood.mjs';   // 每轮收尾的能量微调（2026-10-26）
 import { autoLogEvent } from '../ev-autolog.mjs';   // 每轮自动记一条事件（2026-10-26）
+import { finishTickLog, logLastTick, writeTickLog } from '../tick-log.mjs';   // ⑨ 每段状态落盘 `state/tick-last.json`（2026-11-08）：崩了也能查上轮卡在哪段
+// ⑩ 周期维护（备份轮转 + 图谱刷新）+ 旧版记忆库：逻辑与节流都在 tick-maintain.mjs（2026-11-09 按域拆出）
+import { runLegacyRefresh, runMaintain } from './tick-maintain.mjs';
 
 /** sweep（体检）的最小间隔：默认 55 分钟 —— tick 每 30 分钟一次，55 让它「隔一次跑一次」。
  *  为什么不是 60：计划任务的触发时刻会漂几秒（实测 :16:05 / :16:07），60 会把「刚好 59 分」判成跳过。 */
@@ -49,6 +52,10 @@ const stampFile = (dir, name) => path.join(dir, 'state', name);
 export function runTickCommand({ opt, dir, cwd, log }) {
   const t0 = Date.now();
   const marks = [];
+  // quick 模式（2026-10-23 新增，给「每轮收尾自动刷新」用）：只跑 ingest + handoff。
+  // 全量 tick 约 20 s（不含 legacy 的 104 s），每轮跑会把 CPU 吃光；而「实时」真正需要的
+  // 只有「把这一轮的对话落进 journal」+「交接快照别过期」，其它段落都是按小时/按天尺度的事。
+  const quick = !!opt('quick');   // ⚠️ 必须在 step 定义之前：step 里的 writeTickLog 要读它（否则是 TDZ）
   /** 包一段：计时 + 失败隔离。**失败不抛出**，只记进 marks 并让返回值走兜底。 */
   const step = (name, fn) => {
     const s = Date.now();
@@ -62,13 +69,11 @@ export function runTickCommand({ opt, dir, cwd, log }) {
       //    而 JS 里空数组是 truthy ⇒ 用 !! 判定会把「真跑了 5 秒」误标成「·跳过」（2026-10-23 当场栽）。
       skipped: !!(out && out.skipped === true),
     });
+    writeTickLog(dir, { at: t0, quick, steps: marks });   // 段一结束增量落盘(done:false)：崩了正好停在最后一个跑完的段
     return out;
   };
 
-  // quick 模式（2026-10-23 新增，给「每轮收尾自动刷新」用）：只跑 ingest + handoff。
-  // 全量 tick 约 20 s（不含 legacy 的 104 s），每轮跑会把 CPU 吃光；而「实时」真正需要的
-  // 只有「把这一轮的对话落进 journal」+「交接快照别过期」，其它段落都是按小时/按天尺度的事。
-  const quick = !!opt('quick');
+  if (logLastTick(dir, log, !!opt('last'))) return;   // ⑨ 先回看上一轮落盘的每段状态；`--last` = 只读：打完摘要就退，不跑段、不覆盖记录
 
   // ① 摄入：会话流水 → journal/pages（`--full` 从零重读）
   const r1 = step('ingest', () => ingest(dir, { cwd, full: !!opt('full') })) || { added: 0, sessions: 0 };
@@ -111,6 +116,8 @@ export function runTickCommand({ opt, dir, cwd, log }) {
     const changed = String(r.stdout || '').trim().split('\n').filter((x) => x.includes('已刷新')).length;
     return { note: '｜知识页目录：' + (r.status === 0 ? (changed ? changed + ' 页已刷新' : '最新') : '⚠️ 刷新失败') };
   }) || {});
+  // ⑩ 周期维护：备份轮转（按天删自动产物）+ 图谱产物刷新，各自带 stamp 节流（见 tick-maintain.mjs）
+  const rm = quick ? {} : (step('maintain', () => runMaintain({ dir, opt, log })) || {});
 
   // 汇总行（保持 2026-09-21 起的格式：test-mechanisms 第 18 节有断言守着「主干同步」这一段）
   const sweepNote = quick
@@ -125,7 +132,8 @@ export function runTickCommand({ opt, dir, cwd, log }) {
     + (rp.removed ? '｜清 live：' + rp.removed + ' 个过期会话状态' : '')
     + '｜' + sweepNote
     + '｜主干同步：' + (r5.ok ? (r5.drift ? '⚠️ ' + r5.drift + ' 处不一致（跑 sync 看详情）' : '一致') : '（找不到 MEMORY.md）')
-    + (r6.note || ''));
+    + (r6.note || '')
+    + (rm.note || ''));
 
   // ⑧ 联想收件箱（2026-10-18 用户拍板方案 A：收件箱 + 定时拉子代理审批）
   // quick 模式跳过：做梦/收件箱/按天页都是「每天一次」尺度的事，每轮跑纯属浪费。
@@ -156,35 +164,10 @@ export function runTickCommand({ opt, dir, cwd, log }) {
     }
   }
 
-  // 分段耗时（2026-10-23 新增：以后不用再手工探针 —— 谁慢一眼看出来）
-  log('[分段] ' + marks.map((m) => {
-    if (!m.ok) return m.name + ' ⚠️' + (m.err ? '（' + m.err + '）' : '');
-    if (m.skipped) return m.name + '·跳过';
-    return m.name + ' ' + (m.ms / 1000).toFixed(1) + 's';
-  }).join('｜') + '｜合计 ' + ((Date.now() - t0) / 1000).toFixed(1) + 's');
+  // 分段耗时（2026-10-23）+ ⑨ 落一份 done:true 的终稿（2026-11-08，渲染与落盘都在 tick-log.mjs）
+  finishTickLog(dir, { at: t0, quick, steps: marks }, log);
 
-  // ⑨ 旧版记忆库（异步、不等待）。`--no-legacy` 关掉；**再加一道节流**（2026-10-23）：
-  //    计划任务 `DSH-Memory-Backup` 单独跑同一个 auto_memory.mjs（实测 **104 秒**），
-  //    ⚠️ 它的重复间隔是 **PT6H（每 6 小时）**、不是 30 分钟（2026-10-23 查 Repetition.Interval 实测；
-  //    每 30 分钟那个是 `DSH-Memory-Bank-Save` 跑 tick）。19:30 那个 tick 任务**不带** `--no-legacy`
-  //    ⇒ 同一份活儿在 6 小时内被白跑第二遍。
-  //    ⚠️ 改计划任务参数要管理员权限（2026-10-23 实测 Set-ScheduledTask/schtasks 双双 Access denied），
-  //    所以判据放在代码里：读**它自己的产物** `state/last_run.log` 的 mtime（DB 那个任务的输出就是它），
-  //    新鲜就说明刚跑过；哪天备份任务停了、日志超过 LEGACY_EVERY_MIN ⇒ tick 自己兜底跑。
-  const LEGACY_EVERY_MIN = 360;   // 6 小时 = DSH-Memory-Backup 的周期（PT6H），它刚跑过就不重复
-  if (!opt('no-legacy') && !quick) {
-    let legacyAgeMin = Infinity;
-    try { legacyAgeMin = (Date.now() - fs.statSync('E:/2/_dsh_memory/state/last_run.log').mtimeMs) / 60000; } catch { /* 没跑过 ⇒ 照跑 */ }
-    if (legacyAgeMin < LEGACY_EVERY_MIN) {
-      log(`[记忆银行] 旧版记忆库：跳过（${Math.round(legacyAgeMin)} 分钟前刚被 DSH-Memory-Backup 刷过）`);
-    } else {
-      try {
-        const legacy = 'E:/2/_dsh_memory/auto_memory.mjs';
-        if (fs.existsSync(legacy)) {
-          const c = spawn(process.execPath, [legacy], { stdio: 'ignore', env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' } });
-          c.on('exit', () => log('[记忆银行] 旧版记忆库已刷新'));
-        }
-      } catch { /* 旧库刷新失败不拖垮 tick */ }
-    }
-  }
+  // ⑨ 旧版记忆库（异步、不等待）：`--no-legacy` 关掉，节流读 `state/last_run.log` 的 mtime ——
+  //    判据与实现 2026-11-09 搬进 commands/tick-maintain.mjs 的 `runLegacyRefresh`（当时本文件 189/190 只剩 1 行）。
+  if (!quick) runLegacyRefresh({ opt, log });
 }

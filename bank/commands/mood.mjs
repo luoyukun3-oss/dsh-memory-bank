@@ -5,11 +5,17 @@
 //
 // ⚠️ 这里**没有 `audit` 子命令**（2026-10-13 当天加过又删掉）：那个审计扫的是本机会话日志，
 //   而日志里说话的就是用户 ⇒ 等于把用户当成"施压来源"来统计，对象错了。理由见 mood.mjs 头注释。
-import { MOOD_WEIGHT_NAMES } from '../config-keys.mjs';
-import {
-  clearMood, currentMoodWeight, formatMoodReport, formatMoodWeightReport, loadMood,
-  moodSnapshot, setMood, setMoodWeight,
-} from '../mood.mjs';
+import { MOOD_WEIGHT_NAMES, isDangerWeight, parseMoodWeight } from '../config-keys.mjs';
+import { clearMood, currentMoodWeight, formatMoodReport, formatMoodWeightReport,
+  loadMood, moodSnapshot, setMood, setMoodWeight } from '../mood.mjs';
+
+/** 危险档告警（2026-11-09 兑现 todos：config-keys 早写明「界面/CLI 都要红字提示」而两侧都没实现 ⇒ 静默生效）。 */
+const dangerWarn = (level) => (!isDangerWeight(level) ? null : [
+  `🔴🔴 危险档「${MOOD_WEIGHT_NAMES[parseMoodWeight(level)]}」已启用 —— 它破掉情绪 v2 的两条地基：`,
+  '   ① 气氛段**提前注入**（插到【全局偏好】之后 ⇒ 从"读完事实后的补充"变成"读事实前的定调"，典型 priming）',
+  '   ② 允许**不带 --evidence 裸写气氛**（普通档一律拒写；裸写的每条打 unsafe:true 留痕，注入段会标出来）',
+  '   ⚠️ 不破的那条：score（事实分）任何档位下**一个字都不许变**。退出危险档：cli mood weight mid',
+].join('\n'));
 
 /**
  * `cli mood [show|set|clear]`
@@ -20,8 +26,9 @@ import {
 export function runMoodCommand({ sub = 'show', arg, opt, log, dir }) {
   if (sub === 'show') {
     if (opt('json')) { log(JSON.stringify(moodSnapshot(dir), null, 2)); return; }
-    // ⚠️ 第 2 个参数（档位）**必须传**：漏了不报错，只会静默按默认档渲染 ⇒ 报告里显示的档位是假的。
-    log(formatMoodReport(loadMood(dir), currentMoodWeight(dir)));
+    // ⚠️ 第 2 个参数（档位）**必须传**（漏了只会静默按默认档渲染）；危险档时每次看都提醒，否则它会一直静默生效。
+    const w = currentMoodWeight(dir);
+    log(formatMoodReport(loadMood(dir), w)); const dw = dangerWarn(w); if (dw) log(dw);
     return;
   }
   if (sub === 'set') {
@@ -38,6 +45,7 @@ export function runMoodCommand({ sub = 'show', arg, opt, log, dir }) {
           : `气氛已设定：**${r.record.label}**（首条记录）`)
         : `气氛已刷新：${r.record.label}（标签未变，只更新了证据/强度）`);
       log(formatMoodReport(r.mood, currentMoodWeight(dir)));
+      if (r.mood?.current?.unsafe) log('🔴 本条气氛是**危险档下裸写**的（没给 --evidence）⇒ 已打 unsafe:true 留痕，注入段会标出来。');   // 危险档允许裸写，必须当场说清
     } catch (e) { log(`❌ ${e.message}`); process.exitCode = 1; }
     return;
   }
@@ -64,6 +72,7 @@ export function runMoodCommand({ sub = 'show', arg, opt, log, dir }) {
         ? `权重档位已改为：**${MOOD_WEIGHT_NAMES[r.config.weight]}（${r.config.weight}）**`
         : `权重档位本来就是「${MOOD_WEIGHT_NAMES[r.config.weight]}」—— 没变`);
       log(formatMoodWeightReport(r.config.weight));
+      const dw = dangerWarn(r.config.weight); if (dw) log(dw);   // ← 兑现「切到危险档必须醒目提示」
     } catch (e) { log(`❌ ${e.message}`); process.exitCode = 1; }
     return;
   }

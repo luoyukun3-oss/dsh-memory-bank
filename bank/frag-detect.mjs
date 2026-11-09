@@ -33,46 +33,17 @@
 //   技术噪声（`</p`×36 等）因不在词表内被天然挡掉。阈值见 config-keys 的 SELF_REPEAT_MIN。
 // ============================================================
 
-import { REPEAT_MIN, TECH } from './slope-detect.mjs';
+import { REPEAT_MIN } from './slope-detect.mjs';
 import { FRAG_MIN_CHARS, FRAG_RATIO_MIN, SELF_REPEAT_MIN } from './config-keys.mjs';
+import { SELF_ORDER, fragmentOf } from './frag-metrics.mjs';
 
-/** 多短算"碎片"（≤ 此长度的短句字符数计入分子）。 */
-const FRAG_SENT_MAX = 6;
-/** 超过这个长度的句子不算"复读短句"（与 slope-detect 的 SENT_MAX 一致）。 */
-const SENT_MAX = 12;
-
-/** 「自促词」（坡面三型，2026-11-02）：作为独立短句反复出现 ⇒ 是自己催自己，不是分析。
- *  词表只收**实测出现过**的（好/做/写/跑/嗯），外加同族动作词；⚠️ 别放 `TECH` 里的词（会被 TECH 先挡掉，
- *  如「输出」），也别收长句——`fragmentOf` 只统计 ≤12 字的句子。 */
-export const SELF_ORDER = new Set(['好', '做', '写', '跑', '开跑', '干', '继续', '收工', '动手', '记下', '快', '嗯']);
-
-/**
- * 单条思考的碎片指标。
- * @param {string} reason 思考文本
- * @returns {{top:string, repeat:number, fragRatio:number, chars:number}}
- *   top/repeat = 重复最多的那个短句及其次数（技术词、纯符号数字不计）；
- *   fragRatio = ≤FRAG_SENT_MAX 字的短句字符数 ÷ 全部短句字符数。
- */
-export function fragmentOf(reason) {
-  const text = String(reason || '');
-  const counts = new Map();
-  let total = 0, frag = 0;
-  for (const raw of text.split(/[。！？\n]/)) {
-    const s = raw.replace(/[*`#>\s]/g, '').trim();
-    if (!s) continue;
-    total += s.length;
-    if (s.length <= FRAG_SENT_MAX) frag += s.length;
-    if (s.length <= SENT_MAX) counts.set(s, (counts.get(s) || 0) + 1);
-  }
-  let top = '', repeat = 0;
-  for (const [k, v] of counts) {
-    if (v <= repeat) continue;
-    if (TECH.has(k.toLowerCase())) continue;      // 反复念技术词是正常排查
-    if (/^[^\p{L}]+$/u.test(k)) continue;         // 纯符号 / 纯数字（如 "/"、"}"）不算复读短句
-    repeat = v; top = k;
-  }
-  return { top, repeat, fragRatio: total ? frag / total : 0, chars: text.length };
-}
+// —— 2026-11-09 按域拆（本文件当时 118/120 顶格）：指标与词表搬到 `frag-metrics.mjs` ——
+//   「一条思考长什么样」是**纯函数、零 IO**，与「扫一批记录 / 判命中」是两件事。
+//   ⚠️ **对外接口一字不变**：`test-frag.mjs` 仍从 `./frag-detect.mjs` 取这四个符号。
+//   ⚠️ 三个阈值键（FRAG_MIN_CHARS / FRAG_RATIO_MIN / SELF_REPEAT_MIN）**故意留在本文件**：
+//      `config-keys.mjs` 的 CONSUMERS 把它们登记在本文件，test-arch 第 17 节会断言
+//      「登记的文件里真的出现该键名」⇒ 判定跟着阈值走，指标才搬得走。
+export { SELF_ORDER, fragmentOf };
 
 /**
  * 命中判定 —— **两型**，任一成立即命中：

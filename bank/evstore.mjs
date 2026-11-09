@@ -1,149 +1,23 @@
 // ============================================================================
 // Memory Bank · evstore —— 事件存储（SQLite，2026-10-26 立项）
 //
-// 为什么加这一层：现有 `pages/events.md` 是「一行一个事件」的纯文本，
+// 为什么加这一层：现有 pages/events.md 是「一行一个事件」的纯文本，
 //   全部能力只有"读出来给我看"。实测一个多月只写了 20 条、关联 11 条、
 //   联想词靠手写标记 ⇒ **真正缺的不是检索算法，是事件根本没被当成实体记下来**。
 //
-// 设计三条（改动前先读）：
-//   ① **md 仍是权威，库是视图**：`cli ev import` 从 events.md 全量重建，可随时重跑；
-//      库里的写入暂不回流 md（M2 再做）。这样迁移失败最多丢"库"，不会丢记忆。
-//   ② **raw 列保底**：每行原始文本原样存一份。解析器写错时还能从 raw 重新解析，不丢内容。
-//   ③ **不用 better-sqlite3**：Node 24 自带 `node:sqlite`，零依赖、无编译。
-//
-// 表：events（事件）/ edges（事件→事件）/ entities（名词）/ event_entities（多对多）
+// 🔪 2026-11-09 按域拆分（本文件当时 **294/300，98%**，逼近 budgets.json 红线）：
+//   · 建表 / 打开库（DDL + openDb + DB_FILE）→ evstore-schema.mjs
+//   · events.md 解析 + 实体抽取             → evstore-parse.mjs
+//   本文件留**业务**：导入、改事件、连边、查询与统计。
+//   ⇒ 对外接口**一个没变**：旧导出继续在这里 re-export，调用方（commands/ev.mjs、
+//     ev-autolog.mjs、dream-events.mjs）零改动。
 // ============================================================================
-import { DatabaseSync } from 'node:sqlite';
 import fs from 'node:fs';
 import path from 'node:path';
-
-export const DB_FILE = 'memory.db';
-
-const SCHEMA = `
-CREATE TABLE IF NOT EXISTS events (
-  id          TEXT PRIMARY KEY,
-  at          TEXT,
-  day         TEXT NOT NULL,
-  slot        TEXT,
-  brief       TEXT NOT NULL,
-  detail      TEXT,
-  kind        TEXT,
-  source      TEXT,
-  confidence  TEXT,
-  importance  INTEGER DEFAULT 3,
-  expires     TEXT,
-  raw         TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_events_day ON events(day);
-CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind);
-
-CREATE TABLE IF NOT EXISTS edges (
-  from_id  TEXT NOT NULL,
-  to_id    TEXT NOT NULL,
-  type     TEXT NOT NULL,
-  note     TEXT,
-  strength REAL DEFAULT 1.0,
-  PRIMARY KEY (from_id, to_id, type)
-);
-CREATE INDEX IF NOT EXISTS idx_edges_from ON edges(from_id);
-CREATE INDEX IF NOT EXISTS idx_edges_to ON edges(to_id);
-
-CREATE TABLE IF NOT EXISTS entities (
-  name TEXT PRIMARY KEY,
-  kind TEXT,
-  df   INTEGER DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS event_entities (
-  event_id TEXT NOT NULL,
-  entity   TEXT NOT NULL,
-  PRIMARY KEY (event_id, entity)
-);
-CREATE INDEX IF NOT EXISTS idx_ee_entity ON event_entities(entity);
-
-CREATE TABLE IF NOT EXISTS meta (
-  k TEXT PRIMARY KEY,
-  v TEXT
-);
-`;
-
-/** 打开（必要时创建）库。`dir` 是仓库目录（与 mood.json 同级）。 */
-export function openDb(dir) {
-  const file = path.join(dir, DB_FILE);
-  const db = new DatabaseSync(file);
-  db.exec(SCHEMA);
-  return db;
-}
-
-/** 解析 events.md：返回事件数组。格式见文件头（`## 日期` + `- [时段] 正文 <!-- 元数据 -->`）。 */
-export function parseEventsMd(text) {
-  const out = [];
-  let day = null;
-  let idx = 0;
-  for (const rawLine of String(text || '').split(/\r?\n/)) {
-    const h = rawLine.match(/^##\s+(\d{4}-\d{2}-\d{2})\s*$/);
-    if (h) { day = h[1]; idx = 0; continue; }
-    const m = rawLine.match(/^-\s+(?:\[([^\]]+)\]\s*)?(.+)$/);
-    if (!m || !day) continue;
-    idx += 1;
-    const slotRaw = (m[1] || '').trim();
-    const body = m[2] || '';
-    // ⚠️ 实测 events.md 的真实形状比头注释说的更乱：
-    //   ① 全文只有 `## 2026-09-15` 一个日期节，后面的事件把真实日期写在**正文开头**（"2026-10-13 【…】"）
-    //   ② `[user/high]` 是「来源/置信度」的简写，不是时段
-    //   解析器必须两边都认，否则 days 会算成 1、slot 里会塞进 user/high（本轮实测打脸）。
-    const dateInBody = body.match(/^(\d{4}-\d{2}-\d{2})\s*/);
-    const evDay = dateInBody ? dateInBody[1] : day;
-    const bodyNoDate = dateInBody ? body.slice(dateInBody[0].length) : body;
-    const isSlot = /上午|中午|下午|晚上|深夜|凌晨|早晨|傍晚/.test(slotRaw);
-    const slot = isSlot ? slotRaw : null;
-    const slotAsMeta = !isSlot && slotRaw ? slotRaw : null;   // 形如 user/high
-    // 行尾 HTML 注释里的元数据（i/s/c/x）与 rel:（指向其他页面的关联）
-    const meta = body.match(/<!--([\s\S]*?)-->\s*$/);
-    const comment = meta ? meta[1] : '';
-    const brief = bodyNoDate.replace(/<!--[\s\S]*?-->\s*$/, '').trim();
-    const pick = (k) => {
-      const r = comment.match(new RegExp(`${k}:\\s*([^\\s]+)`));
-      return r ? r[1].trim() : null;
-    };
-    const im = pick('i');
-    const importance = im ? Number(String(im).split('-')[0]) : 3;
-    const metaParts = slotAsMeta ? slotAsMeta.split('/') : [];
-    out.push({
-      id: `ev-${evDay}-${String(idx).padStart(2, '0')}`,
-      day: evDay, slot, brief,
-      detail: null,
-      kind: null,
-      source: pick('s') || metaParts[0] || null,
-      confidence: pick('c') || metaParts[1] || null,
-      importance: Number.isFinite(importance) ? importance : 3,
-      expires: pick('x'),
-      raw: rawLine.trim(),
-      rels: [...comment.matchAll(/rel:([^\s,;]+)/g)].map((r) => r[1]),
-    });
-  }
-  return out;
-}
-
-/** 从事件正文里抽「实体」：文件名、工具名、疑似专名。刻意保守 —— 宁可少抽，不要噪音。 */
-export function extractEntities(text) {
-  const t = String(text || '');
-  const found = new Set();
-  // 文件名 / 路径末段（如 mood.mjs、events.md、tick.mjs）
-  for (const m of t.matchAll(/[A-Za-z0-9_@-]+\.(?:mjs|js|ts|py|json|md|yml|yaml|onnx|exe|zip|log)\b/g)) {
-    found.add(m[0]);
-  }
-  // 反引号里的名字（`cli mood set` → cli / mood 太碎，只留整体）
-  for (const m of t.matchAll(/`([^`]{2,40})`/g)) {
-    const v = m[1].trim();
-    if (v && !/\s/.test(v)) found.add(v);
-  }
-  // 形如 dsh-xxx / ev-xxx / evstore 这类连字符标识
-  for (const m of t.matchAll(/\b[a-z][a-z0-9]*(?:-[a-z0-9]+){1,3}\b/g)) {
-    found.add(m[0]);
-  }
-  return [...found].slice(0, 12);
-}
+import { extractEntities } from './evstore-parse.mjs';   // 抽词口径的唯一实现（见其文件头警语）
+// 对外接口不变（调用方零改动）：老路径 ./evstore.mjs 仍导出同样的名字
+export { DB_FILE, openDb } from './evstore-schema.mjs';
+export { extractEntities, parseEventsMd } from './evstore-parse.mjs';
 
 /**
  * 给**单条**事件补实体（2026-10-29）。

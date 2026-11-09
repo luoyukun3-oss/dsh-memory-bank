@@ -1,5 +1,10 @@
 // 联想收件箱（dream-inbox）—— 2026-10-18 用户拍板：「用 A 做收件箱，定时拉子代理审批」
 // ============================================================
+// 🔪 2026-11-09 按域拆分（本文件当时 260/270，96%，逼近 budgets.json 红线）：
+//   **读与渲染**（fp / fmtLocal / loadInbox / saveInbox / renderInboxMd / formatInboxBrief / markInbox）
+//   已搬到 `dream-inbox-store.mjs`；本文件只剩**入队与筛选**（ingestCandidates：去重→清退→上限降级→补位）。
+//   依赖方向：本文件 → store（单向，store 不 import 本文件）；文件末尾 re-export，**接口不变**。
+//
 // 为什么要有这个模块（背景是查出来的，不是设想）：
 //   `tick` 里的 ⑦ 做梦段（bank/dream.mjs）**早就在后台每 30 分钟跑**（Windows 计划任务
 //   `DSH-Memory-Bank-Save` → `cli.mjs tick`），但候选只被 echo 进 `state/bank_tick.log`：
@@ -26,19 +31,13 @@ import crypto from 'node:crypto';
 // ⚠️ 从 `core.mjs` 取、**不要**从 `bank.mjs` 取：`bank.mjs` 又 re-export 了 `bootstrap.mjs`，
 // 而 bootstrap 要 import 本模块（注入段）⇒ 走 bank 会形成 bootstrap→dream-inbox→bank→bootstrap 的环。
 // core 是叶子模块，从它取工具就没有环（2026-10-18 建模块时定的）。
-import { readJson, writeJson, writeText } from './core.mjs';
+import { readJson } from './core.mjs';
+import { fp, loadInbox, saveInbox, renderInboxMd } from './dream-inbox-store.mjs';
 
-const INBOX_JSON = 'dream-inbox.json';
-const INBOX_MD = 'dream-inbox.md';
 /** pending 上限：超了按 overlap 从低到高降级为 dropped（人审窗口别无限长）。 */
 const MAX_PENDING = 80;
 /** 正文片段长度：让子代理**不用翻页面**就能判（否则每组要多读两次文件）。 */
 const SNIPPET = 240;
-/** 状态白名单。 */
-const STATUS = new Set(['pending', 'approved', 'rejected', 'dropped', 'stale']);
-
-/** 与 dream.mjs 的 fp() 完全一致（两侧字典序 + `|`）—— 见模块头 ②。 */
-export const fp = (a, b) => (a < b ? `${a}|${b}` : `${b}|${a}`);
 
 /** 内容指纹（2026-10-18 加）：`页#序号` 这种 id **会漂** —— 前文一增删，`#96` 就指向别处
  *  （我们踩过：教训页每加一条，后面所有 id 全体后移）。指纹取 title+text 的 sha1 前 12 位：
@@ -48,30 +47,6 @@ const hashOf = (d) => crypto.createHash('sha1')
   .digest('hex').slice(0, 12);
 
 const snip = (t) => String(t || '').replace(/\s+/g, ' ').trim().slice(0, SNIPPET);
-
-/** 时间戳展示：JSON 里存的是 UTC ISO（与 index.json 一致），**给人看的一律转本地**。
- *  为什么不一并存本地：跨时区/夏令时不可靠，且会把「同一时刻」写成两种格式；
- *  为什么展示要转：实测 md 里写成 `2026-10-18T07:22Z` 会被误读成北京时间 07:22（实际 15:22）。 */
-export function fmtLocal(iso) {
-  const d = new Date(String(iso || ''));
-  if (Number.isNaN(d.getTime())) return String(iso || '—');
-  const p = (n) => String(n).padStart(2, '0');
-  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
-}
-/** 只取本地日期（brief 里「最早/最近」用）。 */
-const localDay = (iso) => fmtLocal(iso).slice(0, 10);
-
-/** 读收件箱（缺文件＝空箱，不是错误）。 */
-export function loadInbox(dir) {
-  const d = readJson(path.join(dir, INBOX_JSON), null);
-  if (d && Array.isArray(d.items)) return d;
-  return { version: 1, updatedAt: null, items: [] };
-}
-
-/** 写收件箱（JSON 真身）。 */
-export function saveInbox(dir, box) {
-  writeJson(path.join(dir, INBOX_JSON), box);
-}
 
 /**
  * 把一次「做梦」的结果并入收件箱。
@@ -188,73 +163,8 @@ export function ingestCandidates(dir, r, { now = new Date() } = {}) {
   return { added, refreshed, dropped, restored, staled, killed: nKilled, pending: box.items.filter((it) => it.status === 'pending').length };
 }
 
-/** 把收件箱渲染成 `dream-inbox.md`（人看 + 子代理看的投影；真身是 JSON）。 */
-export function renderInboxMd(dir, box = loadInbox(dir)) {
-  const items = Array.isArray(box.items) ? box.items : [];
-  const cnt = (s) => items.filter((it) => it.status === s).length;
-  const pend = items.filter((it) => it.status === 'pending')
-    .sort((x, y) => (y.overlap - x.overlap) || (y.shared - x.shared));
-  const L = [];
-  L.push('# 联想收件箱（dream-inbox）');
-  L.push('');
-  L.push('> 由 `cli.mjs tick` 自动追加「做梦」候选（**只报告、不动库**）；审批后状态会变。');
-  L.push('> ⚠️ 本页 **不在 `pages/` 里**：不参与召回、不被当成知识页、也不会变成做梦的新枢纽页。');
-  L.push('> 🔁 数据真身＝同目录 `dream-inbox.json`，本页只是它的投影（**别手改本页**）。');
-  L.push('> 🧹 审批：`node E:\\2\\_dsh_memory\\bank\\cli.mjs dream-inbox list`；裁决写文件后跑 `dream-inbox apply <verdicts.json> --apply`。');
-  L.push('');
-  L.push('**待审 pending：' + pend.length + ' 条**（approved ' + cnt('approved') + ' ／ rejected ' + cnt('rejected') + ' ／ dropped ' + cnt('dropped') + '）｜更新于 ' + (box.updatedAt ? fmtLocal(box.updatedAt) : '—'));
-  L.push('');
-  if (!pend.length) L.push('（暂无可审候选）');
-  pend.forEach((it, i) => {
-    const gap = (it.dayGap === null || it.dayGap === undefined) ? '日期未知' : ('日期差 ' + it.dayGap + ' 天');
-    L.push('## ' + (i + 1) + '. `' + it.a.id + ' × ' + it.b.id + '`');
-    L.push('- 重叠 ' + (it.overlap * 100).toFixed(0) + '%｜共享 ' + it.shared + ' 词：' + (it.words || []).join('、') + '｜' + gap);
-    L.push('- A `' + it.a.id + '`「' + String(it.a.title).slice(0, 40) + '」');
-    L.push('  > ' + it.a.snippet);
-    L.push('- B `' + it.b.id + '`「' + String(it.b.title).slice(0, 40) + '」');
-    L.push('  > ' + it.b.snippet);
-    L.push('');
-  });
-  const done = items.filter((it) => it.status !== 'pending');
-  if (done.length) {
-    L.push('---');
-    L.push('');
-    L.push('## 已处理（' + done.length + ' 条，只登记不复述）');
-    L.push('');
-    for (const it of done.slice(-60).reverse()) {
-      L.push('- `' + it.key + '` → **' + it.status + '**' + (it.relType ? ('（' + it.relType + '）') : '') + '（' + fmtLocal(it.lastSeen || it.firstSeen) + '）');
-    }
-    L.push('');
-  }
-  writeText(path.join(dir, INBOX_MD), L.join('\n'));
-}
-
-/** 开场注入用的一行摘要；空箱返回 ''（与 inbox / watch / mood 段同一策略：不占预算）。 */
-export function formatInboxBrief(dir) {
-  const box = loadInbox(dir);
-  const pend = (box.items || []).filter((it) => it.status === 'pending');
-  if (!pend.length) return '';
-  const days = pend.map((it) => localDay(it.firstSeen)).sort();
-  return '【联想收件箱】' + pend.length + ' 条「做梦」候选**待审**（最早 ' + days[0] + '、最近 ' + days[days.length - 1] + '）—— 后台 tick 每 30 分钟自动追加，**没人审就只是排队**。\n→ 审它：`node E:\\2\\_dsh_memory\\bank\\cli.mjs dream-inbox list`（流程见 todos.md 的定时条目）';
-}
-
-// `applyVerdicts` 已按域搬到 `dream-apply.mjs`（2026-10-18：它属于「落库/执行」域，而本文件只管队列）。
-
-/** 单条改状态（手工纠正用）。 */
-export function markInbox(dir, keys, status) {
-  if (!STATUS.has(status)) throw new Error('未知状态 ' + status + '（允许：' + [...STATUS].join('/') + '）');
-  const box = loadInbox(dir);
-  const want = new Set(keys.map((k) => {
-    const [a, b] = String(k).split('|');
-    return fp(a || '', b || '');
-  }));
-  let n = 0;
-  for (const it of box.items) {
-    if (!want.has(it.key)) continue;
-    if (it.status !== status) { it.status = status; n++; }
-  }
-  box.updatedAt = new Date().toISOString();
-  saveInbox(dir, box);
-  renderInboxMd(dir, box);
-  return n;
-}
+// ---------------------------------------------------------------- 出口（读与渲染已按域拆到 dream-inbox-store.mjs，2026-11-09）
+// 本文件当时 260/270（96%）⇒ 把「存储与渲染」搬出去，这里只转发 ⇒
+// `import { loadInbox, renderInboxMd, fp, ... } from './dream-inbox.mjs'`（dream-apply.mjs /
+// commands/dream-inbox.mjs / bootstrap.mjs）一个字都不用改。
+export { fp, fmtLocal, loadInbox, saveInbox, renderInboxMd, formatInboxBrief, markInbox } from './dream-inbox-store.mjs';

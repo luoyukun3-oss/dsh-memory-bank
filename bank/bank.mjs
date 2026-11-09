@@ -12,6 +12,8 @@ import path from 'node:path';
 import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import { INJECT_BUDGET } from './config-keys.mjs';
+// 并发安全的读-改-写（2026-11-08，讨论区指出 sync 会静默覆盖用户手改）
+import { mutateFile } from './safe-write.mjs';
 
 import {
   HERE, BANK, ROOT, REPOS, GLOBAL_SLUG, nowIso, zh, day, readJson, writeJson, writeText, readText, clip, isNoIndexPage, META_KEYS, META_SOURCES, META_CONFS, REL_TYPES, rankRelTargets, parseMeta, ARCHIVED_PAGES, META_PAGES, aliasCache, loadAliases, loadAccess, bumpAccess, slugOf, repoDir, ensureRepo, tokenize, MAGIC, decompressAll, readRecords, textOf, findTranscripts, fingerprint, STOP, isNoise, lineToText, cutText, stripFirstHeading, splitSections, SYNC_MAP, lineSet, lineDiff, pageBlocks,
@@ -74,13 +76,13 @@ export function checkLineBudgets(memRoot) {
 
 
 
-export function syncFromMemory(dir, { memoryFile = 'E:/2/_dsh_memory/MEMORY.md', apply = false, from = 'memory', withDiff = false, only = null } = {}) {
+export function syncFromMemory(dir, { memoryFile = 'E:/2/_dsh_memory/MEMORY.md', apply = false, from = 'memory', withDiff = false, only = null, force = false } = {}) {
   let memText = readText(memoryFile);
   if (!memText.trim()) return { ok: false, report: [], drift: 0, reason: 'no-memory-file' };
   let memBackedUp = false;
   const report = [];
   // 2026-10-29：MEMORY.md 全 CRLF（510 行）、四个知识页全 LF ⇒ 比较前必须先归一化成 LF，
-  // 否则 have === want 永远为假（诊断见 E:\2\记忆库体检-2026-10-29.md 第一节）。
+  // 否则 have === want 永远为假（诊断见当时那份体检报告的第一节）。
   // 写入时再跟随目标文件自身行尾，否则 --apply 两个方向都会制造混合行尾。
   const eolOf = (t) => {
     const crlf = (t.match(/\r\n/g) || []).length;
@@ -107,6 +109,20 @@ export function syncFromMemory(dir, { memoryFile = 'E:/2/_dsh_memory/MEMORY.md',
     if (have === want) { report.push({ ...info, status: 'in-sync' }); continue; }
     if (!apply) { report.push({ ...info, status: have === null ? 'missing-in-page' : 'differs' }); continue; }
 
+    // —— 防「单向覆盖抹掉页面独有内容」（2026-11-08，**这条是真事故换来的**）——
+    //   2026-11-08 19:57:58 有人跑了默认方向的 `sync --apply --from memory`，
+    //   把 `changelog.md` 的「变更记录」整节覆盖成 MEMORY 版 ⇒ **抹掉 7 条页面独有记录、6266 字**
+    //   （只活在 `changelog.md.bak-20261108115758` 里；`.gitignore` 排除 `repos/`，git 也救不回来）。
+    //   而当时 `safe-write.mjs` 的并发保护**挡不住**：它只拦「读之后到写之前有人改过」，
+    //   可那次没人并发改 ⇒ `cur.raw === oldRaw` 成立 ⇒ 直接覆盖。
+    //   ⇒ 判据用现成的 `pageOnly`（= 页面有、MEMORY 没有的行）：**反向会丢东西就别丢**，
+    //     要丢必须显式 `--force`（人已看清代价）。实测：临时库造 2 行页面独有 + 跑 apply，
+    //     改前两条都在、改后两条全没 —— 这就是修这里的理由。
+    if (from !== 'page' && info.pageOnly && info.pageOnly.length && !force) {
+      report.push({ ...info, status: 'page-only-would-be-lost' });
+      continue;
+    }
+
     const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
     if (from === 'page') {
       // 页面 → MEMORY.md（页面更细时用）
@@ -115,24 +131,39 @@ export function syncFromMemory(dir, { memoryFile = 'E:/2/_dsh_memory/MEMORY.md',
       // ⚠️ splitSections 按 \n 切行 ⇒ 在 CRLF 文本上算出的 raw 会以「孤立 \r」结尾，
       // 直接 replace 会吃掉下一个空行的 \r（实测 MEMORY.md 510 CRLF → 509 CRLF + 1 裸 LF）。
       // ⇒ 统一先全转 LF 再操作，最后再转回目标行尾。
-      const eol = eolOf(memText);
-      const lfb = memText.replace(/\r\n/g, '\n');
-      const cur = splitSections(lfb).find((s) => s.title.includes(key));
-      memText = toEol(lfb.replace(cur.raw, () => `## ${cur.title}\n${have}\n`), eol);
-      writeText(memoryFile, memText);
-      report.push({ ...info, status: 'memory-updated' });
+      // 2026-11-08：改走 mutateFile —— 读全文→改→写全文 的窗口里若有人手改 MEMORY.md，
+      //   旧写法会**静默覆盖**。mutateFile 每次重读、写前比指纹，冲突就重做。
+      const r = mutateFile(memoryFile, (fresh) => {
+        const eol = eolOf(fresh);
+        const lfb = fresh.replace(/\r\n/g, '\n');
+        const cur = splitSections(lfb).find((s) => s.title.includes(key));
+        if (!cur) return null;                       // 重读后这节没了 ⇒ 本轮放弃（不硬写）
+        return toEol(lfb.replace(cur.raw, () => `## ${cur.title}\n${have}\n`), eol);
+      });
+      report.push({ ...info, status: r.written ? 'memory-updated' : `memory-${r.reason}` });
     } else {
       // MEMORY.md → 页面（默认方向）
-      if (have !== null) writeText(`${pf}.bak-${stamp}`, pageText);
-      const eol = eolOf(pageText);  // 知识页全 LF ⇒ 不能把 MEMORY 的 \r 带进来
-      const lfp = pageText.replace(/\r\n/g, '\n');
-      const psp = ps ? splitSections(lfp).find((s) => s.title.includes(key)) : null;
-      const out = toEol(psp
-        ? lfp.replace(psp.raw, () => `## ${psp.title}\n${want}\n`)
-        : lfp.replace(/\s+$/, '') + `\n\n## ${ms.title}\n${want}\n`, eol);
-      writeText(pf, out);
-      reindexPage(dir, page);
-      report.push({ ...info, status: have === null ? 'inserted' : 'updated' });
+      // 2026-11-08：同上改走 mutateFile（这是讨论区指出的那条最高危路径）。
+      //   额外做第二重确认：重读后要确认「目标节仍是刚才看到的旧内容」才替换 ——
+      //   只比整文件指纹挡不住「改了两次又改回原样」。
+      const oldRaw = ps ? ps.raw : null;
+      let conflict = false;
+      const r = mutateFile(pf, (fresh) => {
+        const eol = eolOf(fresh);
+        const lfp = fresh.replace(/\r\n/g, '\n');
+        const cur = ps ? splitSections(lfp).find((s) => s.title.includes(key)) : null;
+        if (ps && (!cur || cur.raw !== oldRaw)) { conflict = true; return null; }  // 目标节已被人改过
+        return toEol(cur
+          ? lfp.replace(cur.raw, () => `## ${cur.title}\n${want}\n`)
+          : lfp.replace(/\s+$/, '') + `\n\n## ${ms.title}\n${want}\n`, eol);
+      });
+      if (r.written) {
+        if (have !== null) writeText(`${pf}.bak-${stamp}`, pageText);
+        reindexPage(dir, page);
+        report.push({ ...info, status: have === null ? 'inserted' : 'updated' });
+      } else {
+        report.push({ ...info, status: conflict ? 'page-changed-concurrently' : `page-${r.reason}` });
+      }
     }
   }
   const drift = report.filter((r) => r.status !== 'in-sync').length;
@@ -177,9 +208,12 @@ export function tidyRepo(dir) {
     keep.push(line);
   }
   const body = keep.join('\n').replace(/\n{3,}/g, '\n\n').replace(/[ \t]+$/gm, '').replace(/\s+$/, '') + '\n';
-  writeText(f, body);
-  reindexPage(dir, 'todos.md');
 
+  // —— 写序：**先归档、后删源**（2026-11-08 定，源自 tick 段的写盘点审计）——
+  // 原先是「先写 todos.md（已完成项已删）→ 再写 todos-archive.md」。
+  // 崩在中间 ⇒ 源页那批条目**已经没了、归档里又还没有** ⇒ **永久蒸发**（本模块唯一不可自愈的一处）。
+  // 反过来之后同样的崩 ⇒ 归档里已经有了、源页也还在 ⇒ **重复**，看得见、可以人工去重。
+  // 判据：**重复优于丢失** —— 重复是可见可修的，丢失是不可逆的。
   if (moved.length) {
     const af = path.join(dir, 'pages', 'todos-archive.md');
     const head = readText(af) || '# 已完成归档\n\n> 由 `cli.mjs tidy` 自动归档；不再参与会话开场注入，需要时可 `page todos-archive.md` 查阅。\n';
@@ -202,6 +236,9 @@ export function tidyRepo(dir) {
     writeText(af, out.replace(/\s+$/, '') + '\n');
     reindexPage(dir, 'todos-archive.md');
   }
+
+  writeText(f, body);
+  reindexPage(dir, 'todos.md');
   return {
     moved: moved.length,
     // 条目数（首行）与总行数（含缩进续行）分开报，避免 CLI 上写道"归档 3 条"其实是 1 条 3 行

@@ -28,9 +28,8 @@
 // ⚠️ 全部**高于 recall 的 minScore(0.45)** ⇒ 不会被静默过滤掉（0.46 是下限，别再往下压）。
 // ⚠️ 2 跳必须单独设上限（HOP2_MAX）：不限的话噪声指数级涨，收益跟不上。
 // ============================================================================
-import path from 'node:path';
-import { rankRelTargets, readJson } from './core.mjs';
 import { REL_W, makeRelScorer } from './assoc-rel.mjs';
+import { cooccurTargets, hop2Targets, relCandidates, tagTargets } from './assoc-edges.mjs';
 
 const W = {
   relTyped: 0.55,
@@ -61,50 +60,31 @@ export function appendAssociations(top, docs, dir, query = '', idfOf = null) {
     pool.set(doc.id, { doc, score, via, extra, rel });
   };
 
-  /** rel 边用「页 + 关键词」定位（编号会漂，见 lessons 的「页#N 编号漂移」）。 */
-  const findRel = (page, key) => docs.find((d) => d.page === page && !seed.has(d.id)
-    && ((d.title || '').includes(key) || (d.text || '').includes(key)));
+  // —— 2026-11-09 按域拆（本文件当时 117/120 顶格）——
+  //   「四类邻接关系怎么找」搬到 `assoc-edges.mjs`（纯查询：rel 定位 / 共现 / 同标签 / 2 跳）；
+  //   本文件只留**分数表 W、名额常量、投池 offer、排序与截断**。
+  //   ⚠️ 下面四段的**调用顺序与原实现逐字一致**（rel → 共现 → 标签 → 2 跳）—— 顺序即行为：
+  //      offer 是「同 id 保留高分」，等分时先投的留下。
 
   // —— ① rel 边（1 跳）——人工判断过的边，优先占名额
-  const relTargets = [];
-  for (const h of top) for (const r of (h.meta?.rel || [])) relTargets.push(r);
   const typedDocs = [];   // 带类型的 rel 目标 = 2 跳的出发点
-  for (const t of rankRelTargets(relTargets)) {
-    const d = findRel(t.page, t.key);
-    if (!d) continue;
-    offer(d, t.type ? W.relTyped : W.relPlain, 'rel',
-      { relKey: `${t.page}:${t.key}`, relType: t.type || null });
-    if (t.type) typedDocs.push(d);
+  for (const c of relCandidates(top, docs, seed)) {
+    offer(c.doc, c.type ? W.relTyped : W.relPlain, 'rel', { relKey: c.relKey, relType: c.type });
+    if (c.type) typedDocs.push(c.doc);
   }
 
   // —— ② 共现（1 跳）——行为证据：这两条实际在同一轮里被一起命中过
-  const co = readJson(path.join(dir, 'cooccur.json'), {});
-  for (const h of top) {
-    for (const [oid, n] of Object.entries(co[h.id] || {})) {
-      if (n < 2) continue;   // 只同现过一次不算（可能是巧合）
-      offer(docs.find((d) => d.id === oid), W.cooccur, 'cooccur', { coCount: n });
-    }
-  }
+  for (const c of cooccurTargets(top, dir, docs)) offer(c.doc, W.cooccur, 'cooccur', { coCount: c.coCount });
 
   // —— ③ 同标签（1 跳）——静态主题，最弱的一档，但不怕共现数据冷启动
-  const hitTags = new Set();
-  for (const h of top) for (const tg of (h.meta?.tags || [])) hitTags.add(tg);
-  if (hitTags.size) {
-    for (const d of docs) {
-      const shared = ((d.meta?.tags) || []).filter((tg) => hitTags.has(tg));
-      if (shared.length) offer(d, W.tag, 'tag', { sharedTags: shared });
-    }
-  }
+  for (const c of tagTargets(top, docs)) offer(c.doc, W.tag, 'tag', { sharedTags: c.sharedTags });
 
   // —— ④ 2 跳（2026-10-27 新增）：从「带类型的 rel 目标」再走一跳带类型的 rel。
   //    只走带类型的边 —— 2 跳本来就容易飞，边再没判过语义就没法看了。
   let hop2Used = 0;
-  for (const d of typedDocs) {
+  for (const c of hop2Targets(typedDocs, docs, seed)) {
     if (hop2Used >= HOP2_MAX) break;
-    const next = (d.meta?.rel || []).find((r) => r.type && findRel(r.page, r.key));
-    if (!next) continue;
-    offer(findRel(next.page, next.key), W.hop2, 'rel2',
-      { relKey: `${next.page}:${next.key}`, relType: next.type, via2: d.id });
+    offer(c.doc, W.hop2, 'rel2', { relKey: `${c.next.page}:${c.next.key}`, relType: c.next.type, via2: c.from.id });
     hop2Used += 1;
   }
 

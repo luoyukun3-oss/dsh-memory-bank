@@ -8,27 +8,31 @@ import { INJECT_BUDGET } from './config-keys.mjs';
 import {
   slugOf, ensureRepo, repoDir, recall, ingest, reflect, bootstrapText, tidyRepo,
   reindexPage, readJson, writeJson, writeText, readText, zh, day, clip, syncFromMemory,
-  listItems, archiveItems, sweepRepo, checkLineBudgets,
+  listItems, archiveItems,
 } from './bank.mjs';
-import { auditDegenerate, formatDegenerateReport } from './degenerate-audit.mjs';
-import { auditPatchStatus, formatPatchStatusReport } from './patch-status.mjs';
+import { runAuditCli } from './commands/audit.mjs';    // 体检族（2026-11-09 按域拆出）
+import { verifyIndex, indexStatusLine } from './index-schema.mjs';   // 索引结构自检（2026-11-08）
 import { findDreamPairs, formatDreamReport } from './dream.mjs';
 import { runDreamInboxCommand } from './commands/dream-inbox.mjs';   // 收件箱命令（按域拆出，2026-10-18）
 import { addMemo, doneMemo, listMemo } from './commands/memo.mjs';   // 备忘录（2026-10-18）
 import { writeDay } from './commands/day.mjs';
-import { auditDeadExports, formatDeadReport } from './dead-audit.mjs';
-import { auditPerf, formatPerfReport } from './perf-audit.mjs';
 import { writeHandoff } from './handoff.mjs';
-import { summarizeOmissions, renderOmissions } from './omission.mjs';
+// 召回诊断（2026-11-08 重写）：原 `summarizeOmissions/renderOmissions` 那条路一直是崩的
+// —— `recall()` 根本没有 `explain` 参数，`res.omitted` 恒为 undefined。详见 explain.mjs 头注释。
+import { explainQuery, formatExplain } from './explain.mjs';
+// 逐条「命中来源」（2026-11-08）：只读 hit 自带的 `tokens` / `via` 反推，**不动 search.mjs 热路径**。
+import { buildBasisCtx, describe, formatBasisFooter } from './explain-basis.mjs';
 import { addWatch, applyIssue, clearPending, listWatch, formatWatchList, formatCheckLine } from './watch.mjs';
 import { fetchWatchTarget } from './watch-target.mjs';
 import { formatCueReport, loadCueTable, matchCues } from './cue.mjs';
 import { runMoodCommand } from './commands/mood.mjs';   // 情绪系统 v2（2026-10-13，按域拆出）
 import { runEvCommand } from './commands/ev.mjs';       // 事件存储 SQLite（2026-10-26）
 import { runTickCommand } from './commands/tick.mjs';   // tick 主流程（2026-10-23 按域拆出）
+import { runExtractCli } from './extract.mjs';          // LLM 抽取通道（2026-11-09）：只产 inbox 候选
 import { runRemember } from './commands/remember.mjs';  // remember 域（2026-11-02 按域拆出，并接上事实键）
 import { pruneLive } from './live.mjs';                // tidy 顺手清 live 过期会话状态（2026-10-29）
-import { auditLessons, formatDormantReport } from './lessons-audit.mjs';  // 教训哑弹审计（2026-11-07，trial 质控）
+import { runRotateCommand } from './commands/rotate.mjs';   // 备份轮转（2026-11-09，按域拆出）
+import { runRelCommand } from './commands/rel.mjs';         // 关系编辑（2026-11-09：手动连/断 rel 边）
 
 const argv = process.argv.slice(2);
 const cmd = argv[0] || 'status';
@@ -42,7 +46,7 @@ const dir = ensureRepo(slug, cwd);
 // （AGENTS.md 推荐的就是这个写法，所以影响每一次规范写入）。
 // 白名单列「布尔 flag」，其余 `--x` 一律视为带值；且仅当下一 token 不以 `--`
 // 开头才跳过 —— 这样白名单漏了也只是多收一个参数，不会吞掉后面的 flag。
-const BOOLEAN_FLAGS = new Set(['--json', '--full', '--apply', '--diff', '--split']);
+const BOOLEAN_FLAGS = new Set(['--json', '--full', '--apply', '--diff', '--split', '--both']);
 const positional = [];
 for (let i = 0; i < args.length; i += 1) {
   const a = args[i];
@@ -69,8 +73,15 @@ switch (cmd) {
   case 'recall': {
     const q = positional.join(' ') || String(opt('q', ''));
     const res = recall(dir, q, { k: Number(opt('k', 5)) });
-    if (opt('json')) log(JSON.stringify(res.hits.map((h) => ({ title: h.title, kind: h.kind, page: h.page, score: Number(h.score.toFixed(3)), text: clip(h.text, 200) })), null, 2));
-    else log(res.text || '（记忆银行里没有相关内容）');
+    // 逐条 match_basis（笔记 15.7「哪条路在贡献，不必做 A/B」）：纯反推，不改 search() 热路径。
+    // ⚠️ cue 不在里面 —— 它不是召回来源（只被 hook / cli cue 调用），理由见 explain-basis.mjs 头注释。
+    const bctx = buildBasisCtx(dir, q);
+    if (opt('json')) log(JSON.stringify(res.hits.map((h) => ({ title: h.title, kind: h.kind, page: h.page, score: Number(h.score.toFixed(3)), basis: describe(h, bctx).text, text: clip(h.text, 200) })), null, 2));
+    else {
+      log(res.text || '（记忆银行里没有相关内容）');
+      const foot = formatBasisFooter(res.hits, bctx, { rendered: res.text });   // 逐条核对：命中 ≠ 看到
+      if (foot.length) log(`\n${foot.join('\n')}`);
+    }
     break;
   }
 
@@ -106,14 +117,12 @@ switch (cmd) {
   }
 
   case 'explain': {
-    // 「这条为什么没被召回」（2026-09-30 新增，待办 recall 升级 ②）—— 理由只在显式要时才收集
+    // 「这条为什么排在这里 / 为什么没上来」（2026-11-08 重写为可用版本）
+    //   旧实现调 `recall(..., { explain: true })`，而 recall 没有该参数 ⇒ res.omitted 恒 undefined
+    //   ⇒ `cli.mjs:114` 抛 TypeError，**这条命令从来没跑通过**。
     const q = positional.join(' ') || String(opt('q', ''));
-    const res = recall(dir, q, { k: Number(opt('k', 5)), explain: true });
-    log(`命中 ${res.hits.length} 条：`);
-    for (const h of res.hits) log(`  ✅ ${h.page} ${h.score.toFixed(2)} ${clip(h.title, 46)}`);
-    log(`未命中 ${res.omitted.length} 条  ${summarizeOmissions(res.omitted) || '（无）'}`);
-    const detail = renderOmissions(res.omitted, { perKind: Number(opt('n', 5)) });
-    if (detail) log(detail);
+    if (!q.trim()) { log('用法：cli.mjs explain "<查询>" [--k 5]'); break; }
+    log(formatExplain(explainQuery(dir, q, { k: Number(opt('k', 5)) }), { k: Number(opt('k', 5)) }));
     break;
   }
 
@@ -129,80 +138,10 @@ switch (cmd) {
     break;
   }
 
-  // sweep：定期体检 —— 注入用量 / 各页体积 / 退役候选 / 卡住的队列。
-  // 零风险项（已完成待办归档）随 --apply 自动做；有取舍的**只报告**。
-  case 'sweep': {
-    const r = sweepRepo(dir, { apply: !!opt('apply') });
-    log('【记忆银行 · 体检】');
-    log(`注入 ${r.injectChars} / ${r.budget} 字（余量 ${r.headroom}）${r.headroom < 300 ? ' ⚠️ 余量偏低' : ' ✅'}`);
-    log('');
-    log('| 页 | 字数 | 条目 | i≤2 |');
-    log('|---|---|---|---|');
-    for (const p of r.pages.slice(0, 8)) log(`| ${p.page} | ${p.chars} | ${p.items} | ${p.low || ''} |`);
-    log('');
-    log(`① 零风险项：${r.tidy ? `已归档已完成待办 ${r.tidy.moved ?? 0} 条` : '未执行（加 --apply 才做）'}`);
-    log(`② 待整理队列：inbox ${r.inbox.items} 条${r.inbox.needsWork ? ' ⚠️ 需要出队（整理完就删，别留着 —— 会冒充知识参与召回）' : ' ✅'}`);
-    log(`③ 退役候选（i ≤ 2，人工判定过「主人不会再问」）：${r.lowValue.length} 条`);
-    for (const x of r.lowValue) log(`   - ${x.page}:${x.line}  ${x.title}（i=${x.i}）`);
-    if (r.lowValue.length) {
-      log('');
-      log('   → 移档（不进检索池也不进注入，等于删；但带 _bak 快照、随时可搬回）：');
-      log('     node E:\\2\\_dsh_memory\\bank\\cli.mjs prune --page <页> --match "<正则>" --apply');
-    }
-    // ④ 段原先被嵌在上面的 if (r.lowValue.length) 内 ⇒ ③ 退役候选为 0 时，
-    //    重复条目检测整段不打印（2026-10-10 踩到：当天正好 0 条退役候选，
-    //    于是一对 Jaccard 极高的重复条目被藏住、差点漏看）。
-    //    ④ 是独立指标（重复 = 内容虚增 + 分数摊薄），与「有没有退役候选」无关 ⇒ 移出块外。
-    log('');
-    log(`④ 重复条目（Jaccard ≥ 0.8；重复 = 内容虚增 + 分数摊薄）：${r.dupes.length} 对`);
-    for (const d of r.dupes) log(`   - ${d.sim}  ${d.a} ←→ ${d.b}  「${d.titleA}」/「${d.titleB}」`);
-    if (r.headroomWarn) log(`   ⚠️ 注入余量 ${r.headroom} 低于 800 —— 该瘦身了（否则新增内容会静默顶掉排最后的部分）`);
-    // ⑤ 退化消息（2026-09-18 新增）：只有思考、无正文也无工具调用的空消息。
-    //    判据、成因、实测证据与打印格式都在 bank/degenerate-audit.mjs（打印外移是因为内联会把本文件顶到 95% 预算）。
-    for (const line of formatDegenerateReport(auditDegenerate(cwd))) log(line);
-    // ⑥ 外挂补丁自检（2026-09-18 新增）：补丁写在**应用安装目录**里 ⇒ 升级即被覆盖、
-    //    不重启不生效，而两种情况**都不报错** ⇒ 必须定期复查，别等下次退化时才发现补丁早没了。
-    for (const line of formatPatchStatusReport(auditPatchStatus())) log(line);
-    // ⑦ 性能打点 + 内存判据（2026-09-21）：每次 cli 调用退出时自动记一笔，
-    //    打印留在 bank/perf-audit.mjs（原因同 ⑤：本文件逼近行数预算）。
-    for (const line of formatPerfReport(auditPerf())) log(line);
-    break;
-  }
-
-  // lines：行数预算体检（架构红线，2026-09-18 借自 dsh-pet）
-  // 它的经验：给大文件设**行数预算**、超过即失败，并明确规定
-  // 「预算只随实测校准，**不靠压缩行宽/合并语句硬塞**」。这里给人看；test.mjs 里是自动守护。
-  case 'lines': {
-    const memRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));   // bank/ → _dsh_memory/
-    const r = checkLineBudgets(memRoot);
-    log('【行数预算】只许瘦不许胖 —— 超限先按域拆分，别压缩行宽硬塞');
-    for (const row of r.rows) {
-      if (row.missing) { log(`  ?      ${row.file}  （文件不存在）`); continue; }
-      const flag = row.over ? '❌超限' : row.pct >= 95 ? '⚠️逼近' : '✅    ';
-      log(`  ${flag} ${String(row.lines).padStart(5)} / ${String(row.budget).padStart(5)}  ${String(row.pct).padStart(3)}%  ${row.file}`);
-    }
-    log('');
-    if (r.over.length) {
-      log(`❌ ${r.over.length} 个文件超限：${r.over.map((x) => x.file).join('、')}`);
-      log('   → 按域拆分后再提交；不要为了塞进去而压缩行宽/合并语句。');
-    } else {
-      log('✅ 全部在预算内。');
-    }
-    break;
-  }
-
-  // dead：死机制盘点（借 dsh-pet「死机制清理要逐项 grep 零消费证据」）—— 只列证据、不自动删，
-  // 因为「真死」的最后一步是判断（可能是留给外部的 API、或计划中的用法）。判据必须两轮，见模块头。
-  case 'dead': {
-    for (const line of formatDeadReport(auditDeadExports()).split('\n')) log(line);
-    break;
-  }
-
-  // lessons-audit：教训哑弹审计（2026-11-07 trial 质控）。写成 30 天零命中 ⇒ 哑弹候选，
-  // 只报告不删 —— 判死要人判断（同 cli dead 的规矩）。数据源 access.json（召回 + cue 命中都计数）。
-  case 'lessons-audit': {
-    const r = auditLessons(dir, { days: Number(opt('days', 30)) || 30 });
-    for (const line of formatDormantReport(r, { days: Number(opt('days', 30)) || 30 })) log(line);
+  // 体检族（2026-11-09 按域拆到 commands/audit.mjs）：sweep / lines / dead / lessons-audit。
+  // 四个都是「只读 + 渲染」型（sweep 的 --apply 只归档已完成待办），回归面最小 ⇒ 最先拆。
+  case 'sweep': case 'lines': case 'dead': case 'lessons-audit': {
+    runAuditCli(cmd, { dir, cwd, log, opt, argv });
     break;
   }
 
@@ -260,6 +199,15 @@ switch (cmd) {
     break;
   }
 
+  // extract：LLM 从会话日志里抽候选 —— **产出只进 pages/inbox.md**（未经验证、不进召回），
+  //   晋升仍靠人审。⚠️ 为什么是独立子命令、而不是默认接进 tick：LLM 调用有网络延迟与成本，
+  //   而 tick 每 30 分钟跑一次 ⇒ 一天 48 次调用，成本与耗时都不可控（tick 实测总共 15 秒）。
+  //   先让人手动跑几轮看质量，再由主人决定要不要放进计划任务（`cli extract` 无参数即抽最近会话）。
+  case 'extract': {
+    await runExtractCli({ opt, log, dir, cwd, positional });
+    break;
+  }
+
   // tidy：定期维护 —— 归档已完成项、去重、压缩空行，让会话注入的索引保持干净
   case 'tidy': {
     const r = tidyRepo(dir);
@@ -276,16 +224,27 @@ switch (cmd) {
     const apply = !!opt('apply');
     const from = String(opt('from', 'memory'));
     const diff = !!opt('diff');
+    const force = !!opt('force');   // 2026-11-08：允许覆盖「页面独有的行」（默认拒绝，见 bank.mjs 该处注释）
     const only = opt('only', null);
-    const r = syncFromMemory(dir, { apply, from, withDiff: true, only: only ? String(only).split(',').map((s) => s.trim()).filter(Boolean) : null });
+    const r = syncFromMemory(dir, { apply, from, withDiff: true, force, only: only ? String(only).split(',').map((s) => s.trim()).filter(Boolean) : null });
     if (!r.ok) { log('找不到 MEMORY.md，跳过同步'); break; }
     const dirTxt = from === 'page' ? '知识页 → MEMORY.md' : 'MEMORY.md → 知识页';
     log(`主干同步（${apply ? `已写入：${dirTxt}` : '仅检查，不写入'}）：${r.drift ? `${r.drift} 处不一致` : '全部一致'}`);
     for (const x of r.report) {
-      const icon = x.status === 'in-sync' ? '✅' : (apply ? '✏️' : '⚠️');
+      // 2026-11-08：`page-only-would-be-lost` 是**拒绝写**（不是写完才报警），图标用 🛑 与普通 ⚠️ 区分
+      const icon = x.status === 'in-sync' ? '✅'
+        : (x.status === 'page-only-would-be-lost' ? '🛑' : (apply ? '✏️' : '⚠️'));
       const size = x.chars === undefined ? '' : `  MEMORY ${x.chars} 字 / 页面 ${x.pageChars} 字`;
       log(`  ${icon} ${x.page} ‹${x.section}› ${x.status}${size}`);
-      if (diff && x.status !== 'in-sync') {
+      if (x.status === 'page-only-would-be-lost') {
+        // 把「会丢哪几行」直接摆出来 —— 光说"会丢 N 行"没人会去看
+        log(`      ⚠️ 页面有 ${x.pageOnly.length} 行 MEMORY 里没有，反向覆盖会**抹掉它们**，已拒绝写入。`);
+        for (const l of x.pageOnly.slice(0, 5)) log(`        ${l.slice(0, 110)}`);
+        if (x.pageOnly.length > 5) log(`        …另有 ${x.pageOnly.length - 5} 行`);
+        log(`      做法：① 反向同步保内容 → sync --apply --from page（把页面这几行带回 MEMORY）`);
+        log(`            ② 或者确认可以丢 → sync --apply --force（显式放弃这 ${x.pageOnly.length} 行）`);
+      }
+      if (diff && x.status !== 'in-sync' && x.status !== 'page-only-would-be-lost') {
         const show = (arr, tag) => {
           if (!arr || !arr.length) return;
           log(`      ${tag}（${arr.length} 行）：`);
@@ -318,6 +277,12 @@ switch (cmd) {
     break;
   }
 
+  // rotate：备份文件轮转（2026-11-09）。默认 **dry-run**；实现在 commands/rotate.mjs（按域拆出，本文件 510 行上限）
+  case 'rotate': {
+    runRotateCommand({ opt, log });
+    break;
+  }
+
   case 'status': {
     const meta = readJson(path.join(dir, 'bank.json'), {});
     const pages = fs.existsSync(path.join(dir, 'pages'))
@@ -335,6 +300,13 @@ switch (cmd) {
       if (sc.ok) log(`  主干同步：${sc.drift ? `${sc.drift} 处与 MEMORY.md 不一致（跑 sync 看详情）` : '与 MEMORY.md 一致'}`);
     } catch { /* 同步检查失败不影响 status */ }
     log('  知识页：' + pages.join('、'));
+    // 索引结构自检（2026-11-08）：版本号 + stats 自洽性。**只报不修** ——
+    // 索引可以从 pages/*.md 完全重建，所以"修"永远是 `cli init`，不是自动迁移。
+    try {
+      const v = verifyIndex(dir);
+      log(`  索引自检：${indexStatusLine(dir)}`);
+      for (const p of v.problems) log(`    ⚠️ ${p}`);
+    } catch (e) { log(`  索引自检：检查本身失败（${e.message}）`); }
     break;
   }
 
@@ -437,6 +409,13 @@ switch (cmd) {
     break;
   }
 
+  // rel：关系编辑（2026-11-09）—— 此前手改 rel 边必须记 tools/ 下 4 个脚本的参数，没有「顺手连一条」的入口。
+  //     add/rm **默认 dry-run**，`--apply` 才写；`--both` 双向。实现在 commands/rel.mjs。
+  case 'rel': {
+    runRelCommand({ sub: positional[0] || 'list', positional, opt, log, dir });
+    break;
+  }
+
   // ev：事件存储（SQLite，2026-10-26）—— 事件实体化/关联/联想的第一层。
   //     ⚠️ md 仍是权威：import 从 events.md 全量重建，可反复跑；库里写了不回流。
   case 'ev': {
@@ -445,7 +424,7 @@ switch (cmd) {
   }
 
   default:
-    log('用法：init | remember "内容" [--page x.md] | recall "查询" | cue "文本" [--mode prompt|output] | mood [show|weight|set|clear] | ev [import|list|search|related|entity|stats] | ingest [--full] | reflect | tick | tidy | sweep [--apply] | handoff [--write] | lines | dead | sync [--apply] [--only <页>] | preview | status | page <文件> | items [--page x.md] | prune --page x.md --match "正则" [--apply] | dream | migrate');
+    log('用法：init | remember "内容" [--page x.md] | recall "查询" | cue "文本" [--mode prompt|output] | mood [show|weight|set|clear] | ev [import|list|search|related|entity|stats] | ingest [--full] | reflect | tick [--quick] [--last] | extract [--write] [--max N] [--session 文件] | tidy | sweep [--apply] | handoff [--write] | lines | dead | rel [list|add|rm] | rotate [--apply] [--keep N] | sync [--apply] [--force] [--only <页>] | preview | status | page <文件> | items [--page x.md] | prune --page x.md --match "正则" [--apply] | dream | migrate');
 }
 
 function reindexAllPages() {

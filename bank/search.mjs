@@ -2,25 +2,31 @@
 // Memory Bank · search —— 从 bank.mjs 拆出（2026-09-22）
 //   ⚠️ 本文件**不许 import bank.mjs**（那会循环依赖）；只依赖 node 标准库 + ./core.mjs。
 // ============================================================================
-import { ARCHIVED_PAGES, GLOBAL_SLUG, META_PAGES, bumpAccess, cutText, loadAccess, loadAliases, rankRelTargets, readJson, readText, repoDir, stripFirstHeading, tokenize } from './core.mjs';
+import { loadAccess, loadAliases, tokenize } from './core.mjs';
 import { loadSynonyms } from './synonyms.mjs';   // 烘焙口语变体（只做检索扩展，见该文件头）
+import { buildSearchContext } from './search-context.mjs';   // 索引预载（2026-11-09，见该文件头）
 import { moodBoostMax } from './config-keys.mjs';
 import { appendAssociations } from './assoc.mjs';   // 联想唯一实现（2026-10-27 收拢，见该文件头）
 import { currentMoodWeight, loadMood, moodBoost } from './mood.mjs';
 import path from 'node:path';
-export function search(dir, query, k = 5) {
-  const idx = readJson(path.join(dir, 'index.json'), { docs: [] });
+// —— rel 扩展按查询意图开关（2026-11-08，依据 LivingMemory `_route_weights_for_query`：纯关键词、零模型调用）——
+// 定义/概念类关掉（扩展会把"相关但不是定义"的条目带偏），关系/追溯类保留，判不出来保持现状（误关比不关贵）。
+// ⚠️ 关的时候只抹 `top` 元素的 meta.rel（它们是本次新建对象），**别传 top.map(...) 副本** —— assoc.mjs 往实参数组 push。
+const REL_OFF = /^(?!.*(什么关系|关联|有关|导致|因为|之前|之后|上次|追溯)).*(是什么|什么是|什么意思|怎么用|怎么开|怎么弄|怎么配|怎么设|怎么改|怎么关|怎么做|怎么办|怎么看|怎么查|如何|定义|原理)/;
+/** 检索。`ctx` = 可选**预载上下文**（见 `search-context.mjs` 头注释）：批量同库查询传它，
+ *  可省掉每次 132 ms 的「读 5.53 MB index + 重建 df」。**不传时行为与改前逐字相同**（现场读盘）
+ *  —— 这是 hook 每轮调的热路径，默认路径不许变。ctx 必须来自**同一个 dir**。 */
+export function search(dir, query, k = 5, ctx = null) {
+  const C = ctx || buildSearchContext(dir);
   // —— 当前气氛（情绪系统 v2，2026-10-13）：只用于排序偏置，见下面的接线注释。
   const mood = loadMood(dir);
   // 权重档位（2026-10-13 晚，用户要的「低/中/高」）：它**只缩放下面那个排序加成**，与事实无关。
   const moodLevel = currentMoodWeight(dir);
   // 显式想查字典时才放行元页（"别名表里有哪些组"这类提问仍能命中）
   const wantMeta = /别名|同义|术语表|alias/i.test(String(query || ''));
-  // 归档页不进检索池（2026-09-15）：索引里若还残留旧 doc，这里再兜一层
-  // 元页默认静音（2026-09-15）：别名表不该跟知识抢召回位 —— 见 META_PAGES 注释
-  const docs = (idx.docs || []).filter(
-    (d) => !ARCHIVED_PAGES.has(d.page) && (wantMeta || !META_PAGES.has(d.page)),
-  );
+  // 归档页不进检索池（2026-09-15）、元页默认静音（见 META_PAGES 注释）—— 这两层过滤与 df
+  // 现在都在 `search-context.mjs` 里按 `wantMeta` 分两套算好（2026-11-09），这里只取现成的。
+  const { docs, df, N } = wantMeta ? C.meta : C.plain;
   if (!docs.length) return [];
   const qt = [...new Set(tokenize(query))];
   if (!qt.length) return [];
@@ -51,12 +57,14 @@ export function search(dir, query, k = 5) {
   //   「最近装了什么插件」✅ 命中 → 知识页 ×0.5 → events.md 升到第 1
   //   「上次踩了什么坑」  ✗ 不中 → 不动 → lessons.md 仍是第 1（问经验，知识页本来就对）
   const wantsChangeLog = /(装|改|删|换|配|升级|卸载|安装)了什么/.test(String(query || ''));
-  const N = docs.length;
-  const df = new Map();
-  for (const d of docs) for (const t of new Set(d.tokens || [])) df.set(t, (df.get(t) || 0) + 1);
   const idfOf = (t) => Math.log(1 + N / (df.get(t) || 1));
   const access = loadAccess(dir);
   const now = Date.now();
+  // 双时态（2026-11-08）：查询里有没有「问过去」的词 —— 有就放开口封条目（见下方 supersededBy 处）。
+  //   ⚠️ 词表**刻意收窄**到「明确问历史值」：他原话是「只有问到以前、之前、当时才放开」。
+  //   去掉过「改成什么」「上次」「不再」—— 「上次改权限改成什么了」问的是**当前值**不是历史值，
+  //   放进去会让旧条在不该浮现时浮现（实测语义不成立，虽未造成测试回归）。
+  const askingPast = /以前|之前|当时|原来|曾经|早先|原先|过去|那时候|旧版|早年|原本|从前/.test(String(query || ''));
   const scored = [];
   for (const d of docs) {
     const tf = new Map();
@@ -129,7 +137,11 @@ export function search(dir, query, k = 5) {
     // —— 元数据权重与软遗忘（2026-09-15）：**只降权，绝不删物理内容**
     const m = d.meta || {};
     if (m.confidence === 'low') continue;                     // 低置信（模型推断）不进结果 → 也进不了注入
-    if (m.supersededBy) s *= 0.25;                            // 已被取代（⚠️ pin 不豁免：这是事实问题）
+    // 双时态（2026-11-08，来源 hwshsh《大肥鱼技术手记》）：旧事实**不删只封口**，
+    //   平时降权避免污染；但**问到「以前/之前/当时」就放开** —— 这正是他说的
+    //   「既不被过时信息污染，又能回答『你以前不是这么说的吗』」。
+    //   ⚠️ pin 不豁免这条不变（这是事实问题）；变的只是**查询意图**。
+    if (m.supersededBy) s *= askingPast ? 1.25 : 0.25;
     const pinned = m.pin === true;                             // 引脚固定：永不因时间淡忘
     if (!pinned && m.expires && Date.parse(m.expires) < now) s *= 0.35;  // 已过期（pin 豁免）
     s *= 1 + 0.15 * ((m.importance || 3) - 3);                // 重要度：i=5 ×1.3，i=1 ×0.7
@@ -167,7 +179,16 @@ export function search(dir, query, k = 5) {
         s *= 1.25;   // 标题无日期：整页小幅提升，但仍低于带近期日期的条目
       }
     } else if ((stream || mild) && !pinned) {
-      const last = Math.max(access[d.id] || 0, Date.parse(d.updated || '') || 0);
+      // ⚠️ 2026-11-08 修（本轮实测）：原写 `Math.max(access[d.id] || 0, Date.parse(d.updated) || 0)`。
+      //   `d.updated` 是**索引重建时间**、不是内容更新时间（本文件 168 行的注释已经这么说过了，
+      //   但这里又用了它 —— 同一个文件里自相矛盾）。后果：只要某页被重新索引过（我每天往
+      //   events/decisions 写条目就会触发），该页**所有**条目的 updated 都变成"现在" ⇒
+      //   `Math.max` 把「25 天没被想起」掩盖成「几乎全新」。
+      //   构造实测：access 25 天前 + updated 0.1 天前 ⇒ 旧式乘子 **0.992**，只用 access 是 **0.382**。
+      //   ⇒ 改成「有召回记录就用召回时间，没有才退回 updated」。
+      //   ⚠️ 当前真实数据（123 条走衰减的条目）里 `access < updated` 的有 **0 条** ⇒ 本次改动
+      //     当天影响为 0，它是**防未来**的（真库索引重建后就会发生）。
+      const last = access[d.id] || Date.parse(d.updated || '') || 0;
       if (last) {
         const decay = Math.pow(stream ? 0.995 : 0.998, Math.max(0, (now - last) / 3600000));
         // 下限 0.35：**软遗忘是「降权」，不是「归零」**。若直接用 0.995^Δt 当乘子，
@@ -193,77 +214,16 @@ export function search(dir, query, k = 5) {
   //    ⚠️ 此前本文件与 assoc.mjs 各有一份**逐字相同**的实现，`appendAssociations` 成了零调用方，
   //    改 assoc.mjs 不生效（真正在跑的是这一份）。现在只保留一行调用，唯一实现在 assoc.mjs。
   //    行为变化：三类各 2 个名额 → 一个池按「边权 + 跳数」取前 5，并新增 1 条 2 跳。
+  if (REL_OFF.test(qlow)) for (const h of top) h.meta = { ...h.meta, rel: [] };   // 关 rel 边（判据见文件头 REL_OFF）
   appendAssociations(top, docs, dir, query, idfOf);
   return top;
 }
-
 /**
  * 条目型页面（2026-09-15）：这类页的价值在**条目**上（一行一个事件 / 决策 / 教训）。
  * 若仍按 `##` 节整块索引，条目级元数据（importance / confidence / superseded）会互相覆盖
  * 退化成"节级"，召回也只能返回一整节 1200~1500 字。改为逐条切分 → 元数据真正生效、召回更准更省。
  */
 
-// ---------------------------------------------------------------- 召回
-/** 理由层入口。⚠️ 2026-10-05 事故：原实现随 search.mjs 今天版本一起丢失（误回滚），
- *  而 bank.mjs 的对外接口仍导出它、且全库暂无调用者 ⇒ 先以转发兜底，保证记忆银行能跑。
- *  待办：确认原语义（应返回带"为什么命中"的理由）后补回。 */
-export function searchDetailed(dir, query, opts = {}) {
-  return search(dir, query, opts.k ?? 5);
-}
-
-export function recall(dir, query, { k = 5, budget = 1500, minScore = 0.45, touch = false, dedupeSelf = true, wantTrace = false } = {}) {
-  // 2026-09-15：加 minScore 过滤 —— 宁可返回"没找到"，也别把低分噪声塞进上下文
-  // 自命中过滤（2026-09-15）：journal 里存着用户的**原话**，拿提问去搜必然命中「自己」——
-  // 把用户刚说的话当「记忆」还回去，零信息量还白占注入预算（实测 top 分数 41.6 全是自命中，
-  // 那个 100% 的"命中率"因此是虚高的）。
-  // 判据用**覆盖率**（查询词有多少落在该片段里）而不是 Jaccard —— 流水片段带着时间戳与
-  // `**[用户]**` 标记，这些额外 token 会把 Jaccard 稀释掉，短查询就漏过去了。
-  // 只对 `kind: 'journal'` 生效，知识页条目不受影响（免得「闰年判断」这种查询把同名知识条目误杀）；
-  // 长提问（>60 字，多为粘贴的整段代码/长句）用更松的阈值。
-  let hits = search(dir, query, k * 3).filter((h) => h.score >= minScore);
-  // 2026-10-21：默认排除 journal（流水是原料、不是知识）。原先只靠 dedupeSelf 的覆盖率过滤，
-  //   实测覆盖率 75% 的流水片段能漏过去并抢 top-1（「循环次数不能填小数」→ journal 1.51）。
-  //   要流水（问「今天做了什么」）时传 wantTrace: true。
-  if (!wantTrace) hits = hits.filter((h) => h.kind !== 'journal');
-  if (dedupeSelf) {
-    const qset = new Set(tokenize(query));
-    const thr = String(query).length > 60 ? 0.6 : 0.8;
-    hits = hits.filter((h) => {
-      // 2026-09-15 修正：原先只过滤 `kind === 'journal'`，**放过了 `inbox.md`** ——
-      // 实测「电脑变慢 界面发钝 风扇一直响」的 top-1 正是一条任务提示词（覆盖 10/10、2.26 分）。
-      // 2026-09-16 起 `inbox.md` 已在**打分阶段直接 `continue` 排除**（见该处注释），
-      // 这里的 `h.page === 'inbox.md'` 保留为**第二道防线**；痕迹页按同一把尺子过滤。
-      const isTrace = h.kind === 'journal' || h.page === 'inbox.md';
-      if (!isTrace || !qset.size) return true;
-      const tset = new Set(tokenize(h.text));
-      let inter = 0;
-      for (const t of qset) if (tset.has(t)) inter++;
-      return inter / qset.size < thr;
-    });
-  }
-  hits = hits.slice(0, k);
-  const gdir = repoDir(GLOBAL_SLUG);
-  const gt = readText(path.join(gdir, 'pages', 'preferences.md'));
-  const lines = [];
-  let used = 0;
-  if (gt.trim()) {
-    const g = '【全局偏好】\n' + cutText(stripFirstHeading(gt), 400);
-    lines.push(g);
-    used += g.length;
-  }
-  for (const h of hits) {
-    // ⚠️ 2026-09-15 修复：这里原先用 clip()，把所有换行压成空格，召回内容糊成一坨。
-    //    同理 index.json 里存的 text 也不能用 clip（见 reindexPage），否则源头就没换行。
-    const seg = `【${h.kind}｜${h.title}】\n${cutText(h.text, 420)}`;
-    if (used + seg.length > budget && lines.length > 1) continue;
-    lines.push(seg);
-    used += seg.length;
-  }
-  // 复述效应（2026-09-15）：命中即刷新访问时间，让「用过的记忆」下次更容易被想起
-  if (touch) bumpAccess(dir, hits.map((h) => h.id));
-  return { hits, text: lines.join('\n') };
-}
-
-// ---------------------------------------------------------------- 会话启动摘要
-// 注意：不要在这里用 clip() —— 它会把所有换行/缩进压成单个空格，
-// 结构一没，模型读长文本的注意力就明显下降（2026-09-14 修的 bug）。
+// ---------------------------------------------------------------- 召回（2026-11-09 按域拆到 search-recall.mjs）
+// 本文件 289/290 逼近红线 ⇒ recall / searchDetailed 外移；接口不变，bank.mjs 的 re-export 照旧。
+export { searchDetailed, recall } from './search-recall.mjs';

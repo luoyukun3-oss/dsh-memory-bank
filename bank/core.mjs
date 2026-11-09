@@ -13,7 +13,7 @@ export const HERE = path.dirname(fileURLToPath(import.meta.url));
 
 export const BANK = path.join(HERE, '..');            // _dsh_memory/bank
 
-export const ROOT = path.join(BANK, '..', '..');      // E:\2
+export const ROOT = path.join(BANK, '..', '..');      // 工作区根（通常是记忆库目录的上一层）
 
 export const REPOS = path.join(BANK, 'repos');
 
@@ -33,9 +33,29 @@ export const day = (d = new Date()) => {
 
 export const readJson = (f, fb = null) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return fb; } };
 
-export const writeJson = (f, o) => { fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, JSON.stringify(o, null, 2), 'utf8'); };
+// —— 原子写（2026-11-08，借 LivingMemory `index_validator_rebuild.py` 的「影子 + 原子切换」）——
+// 原实现是裸 `fs.writeFileSync(f, ...)`：写到一半崩 / 被杀 ⇒ **目标文件是半成品**
+//   （JSON 截断就直接坏掉，而 `readJson` 的 `catch` 会把它当"空库"返回 ⇒ 静默变成空）。
+//   这个隐患是**全库性**的：`writeText`/`writeJson` 有 48 个调用点，覆盖 index.json / access.json /
+//   state.json / journal / pages —— 任意一个截断都会变成难查的"数据莫名变少"。
+// 它那边的做法是：建影子表 → 建好才 ALTER RENAME 切换 → `if not switched: DROP shadow`（线上一个字节不动）。
+//   md+文件系统的等价物 = **同目录临时文件 + rename**：同目录保证同一文件系统，rename 才原子。
+// ⚠️ 前提实测过（2026-11-08，win32 / Node 24.21.0）：`fs.renameSync(tmp, 已存在的目标)` **能覆盖**，
+//   tmp 消失、内容为新。这是整个改法成立的前提，别凭印象假设 Windows 不行。
+// ⚠️ 失败要清理 tmp：否则崩一次就在目录里留一堆 `.tmp-<pid>-<ts>` 垃圾。
+export const writeText = (f, t) => {
+  fs.mkdirSync(path.dirname(f), { recursive: true });
+  const tmp = `${f}.tmp-${process.pid}-${Date.now().toString(36)}`;
+  try {
+    fs.writeFileSync(tmp, t, 'utf8');
+    fs.renameSync(tmp, f);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch { /* 清理失败就算了，别把原始错误盖掉 */ }
+    throw e;
+  }
+};
 
-export const writeText = (f, t) => { fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, t, 'utf8'); };
+export const writeJson = (f, o) => writeText(f, JSON.stringify(o, null, 2));
 
 export const readText = (f, fb = '') => { try { return fs.readFileSync(f, 'utf8'); } catch { return fb; } };
 
@@ -278,91 +298,8 @@ export function tokenize(text) {
 }
 
 // ---------------------------------------------------------------- 会话日志读取
-export const MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd]);
-
-export function decompressAll(buffer) {
-  const marks = [];
-  let i = buffer.indexOf(MAGIC);
-  while (i !== -1) { marks.push(i); i = buffer.indexOf(MAGIC, i + 4); }
-  if (!marks.length) return zlib.zstdDecompressSync(buffer);
-  const parts = [];
-  let pos = 0;
-  while (pos < marks.length) {
-    const end = pos + 1 < marks.length ? marks[pos + 1] : buffer.length;
-    try { parts.push(zlib.zstdDecompressSync(buffer.subarray(marks[pos], end))); pos++; continue; } catch {}
-    let k = pos + 1, ok = false;
-    while (k < marks.length) {
-      const e2 = k + 1 < marks.length ? marks[k + 1] : buffer.length;
-      try { parts.push(zlib.zstdDecompressSync(buffer.subarray(marks[pos], e2))); pos = k + 1; ok = true; break; } catch { k++; }
-    }
-    if (!ok) break;
-  }
-  return Buffer.concat(parts);
-}
-
-
-export function readRecords(transcriptPath) {
-  const text = decompressAll(fs.readFileSync(transcriptPath)).toString('utf8');
-  const out = [];
-  for (const line of text.split('\n')) {
-    if (!line.trim()) continue;
-    try { out.push(JSON.parse(line)); } catch {}
-  }
-  return out;
-}
-
-
-export const textOf = (content) => (content || []).filter((c) => c && c.type === 'text' && typeof c.text === 'string').map((c) => c.text).join('\n').trim();
-
-/** 会话日志可能落在哪些 harness home（2026-09-30 新增官方桌面版的 ~/.dsh）。
- *  起因：旧壳用 %APPDATA%\dsh-desktop\harness，官方版用 ~/.dsh ——
- *  只扫一个根，另一个 App 里的对话就永远进不了记忆库（实测 tick 摄入不到）。 */
-export function transcriptHomes(extra) {
-  const seen = new Set();
-  const out = [];
-  const add = (p) => {
-    if (!p) return;
-    const norm = path.resolve(p).replace(/[\\/]+$/, '');
-    if (seen.has(norm.toLowerCase())) return;
-    seen.add(norm.toLowerCase());
-    try { if (fs.statSync(norm).isDirectory()) out.push(norm); } catch { /* 不存在就跳过 */ }
-  };
-  add(process.env.DSH_HOME);
-  if (process.env.APPDATA) add(path.join(process.env.APPDATA, 'dsh-desktop', 'harness'));  // 旧壳 DSH Desktop
-  if (process.env.USERPROFILE) add(path.join(process.env.USERPROFILE, '.dsh'));            // 官方 DeepSeek Harness
-  for (const p of extra || []) add(p);                                                    // 调用方/测试追加
-  return out;
-}
-
-/** 在 DSH sessions 目录里找某仓库的会话日志（多根合并，见 transcriptHomes） */
-
-export function findTranscripts(cwd, extraHomes) {
-  const slug = `--${path.resolve(cwd).replace(/[:\\]/g, '-').replace(/^-+/, '')}--`.toLowerCase();
-  const out = [];
-  const walk = (d) => {
-    let es = [];
-    try { es = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
-    for (const e of es) {
-      const p = path.join(d, e.name);
-      if (e.isDirectory()) walk(p);
-      else if (e.name.endsWith('.jsonl.zstd')) out.push({ file: p, size: fs.statSync(p).size, mtime: fs.statSync(p).mtimeMs, dirName: path.basename(path.dirname(p)) });
-    }
-  };
-  for (const home of transcriptHomes(extraHomes)) walk(path.join(home, 'sessions'));
-  // 目录名形如 --E-2--：优先匹配当前仓库，匹配不到就全部返回（由调用方过滤）
-  const matched = out.filter((o) => o.dirName.toLowerCase().includes(slug.replace(/^--|--$/g, '')));
-  return (matched.length ? matched : out).sort((a, b) => b.mtime - a.mtime);
-}
-
-
-export function fingerprint(s) {
-  return String(s || '')
-    .replace(/^\d{4}-\d{2}-\d{2}\s+/, '')
-    .replace(/^\[[^\]]+\]\s*/, '')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 50);
-}
+// 2026-11-09 按域拆到 core-transcript.mjs（core 原 509/510 逼近红线）——这里只转发，接口不变。
+export { MAGIC, decompressAll, readRecords, textOf, transcriptHomes, findTranscripts } from './core-transcript.mjs';
 
 /**
  * 行数预算检查（架构红线，2026-09-18 借自 dsh-pet）。
@@ -377,113 +314,8 @@ export function fingerprint(s) {
  * @param {string} memRoot `_dsh_memory` 目录（预算表里的路径都相对它）
  */
 
-export const STOP = new Set([
-  '用户', '助手', '主人', '一下', '一个', '一些', '什么', '怎么', '这个', '那个', '可以', '应该', '不是', '就是',
-  '我们', '你们', '他们', '现在', '还是', '因为', '所以', '但是', '如果', '然后', '已经', '这些', '那些',
-  '看看', '帮我', '我想', '时候', '地方', '为什么', '还有', '内容', '结果', '情况', '问题', '方法', '东西',
-  '这里', '那里', '没有', '需要', '想要', '知道', '觉得', '开始', '以及', '关于', '一样', '一起', '上面',
-  '下面', '之后', '之前', '这样', '那样', '多少', '是不是', '直接', '可能', '不太', '有点', '好像', '确认',
-  'the', 'and', 'you', 'that', 'this', 'with', 'have', 'what', 'how', 'why', 'are', 'was', 'were', 'will',
-  'can', 'not', 'but', 'its', 'it', 'is', 'in', 'of', 'to', 'as', 'at', 'on', 'by', 'my', 'me', 'we',
-  // 2026-09-15 改良：补 Python 关键字与常见代码词 —— 之前把 print / for / range 当成「高频话题」，
-  // 反思的第一节与第五节全被代码词占满（连续两日候选八条一字未变，纯属噪声）。
-  'print', 'input', 'for', 'if', 'else', 'elif', 'while', 'range', 'def', 'return', 'try', 'except',
-  'int', 'str', 'float', 'list', 'dict', 'len', 'type', 'true', 'false', 'none', 'python', 'py',
-  'break', 'continue', 'import', 'from', 'class', 'self', 'lambda', 'yield', 'async', 'await',
-]);
-
-/** 噪音词判据：空 / 单字 / 纯数字 / 短数字+字母 / 停用词。
- *  ⚠️ 2026-09-19 起**导出**：`cli dream`（找"意外关联"）也要用它 —— 之前它是内部函数，
- *  我在临时脚本里没套用，结果 `758`、`988` 这类数字全被当成"罕见词"混进候选。 */
-
-export const isNoise = (t) => !t || t.length < 2 || /^\d+$/.test(t) || /^\d{1,2}[a-z]{0,2}$/.test(t) || STOP.has(t);
-
-/** 从流水行里剥掉标记与时间戳，只留用户原话 */
-
-export const lineToText = (l) => l
-  .replace(/^-\s*/, '')
-  .replace(/^\*\*\[(用户|助手[^]]*)\]\*\*\s*/, '')
-  .replace(/^\d{4}\/\d{1,2}\/\d{1,2}\s+\d{1,2}:\d{2}:\d{2}\s*/, '')
-  .trim();
-
-// 结构性截断：保留换行和列表结构，只在行边界处切
-export const cutText = (s, n) => {
-  const t = String(s || '').replace(/\r\n/g, '\n').replace(/[ \t]+$/gm, '').replace(/\n{3,}/g, '\n\n').trim();
-  if (t.length <= n) return t;
-  const head = t.slice(0, n);
-  const cut = head.lastIndexOf('\n');
-  return (cut > n * 0.5 ? head.slice(0, cut) : head) + '\n…（已截断，完整内容见对应文件）';
-};
-
-
-export const stripFirstHeading = (s) => String(s || '').replace(/^#[^\n]*\n?/, '').trim();
-
-
-export function splitSections(text) {
-  const out = [];
-  for (const p of String(text || '').split(/\n(?=##\s)/)) {
-    const m = p.match(/^##\s+(.+?)\s*$/m);
-    if (!m) continue;
-    const at = p.indexOf(m[0]);
-    out.push({ title: m[1].trim(), body: p.slice(at + m[0].length).trim(), raw: p });
-  }
-  return out;
-}
-
-/** MEMORY.md 的哪些章节 ↔ 哪个知识页 */
-
-export const SYNC_MAP = [
-  ['主人（用户）画像', 'preferences.md'],
-  ['助手的工作习惯', 'preferences.md'],
-  ['环境信息', 'environment.md'],
-  ['故障备忘', 'faults.md'],
-  ['变更记录', 'changelog.md'],
-];
-
-/** 行级差异（忽略空白与空行），用于判断"该往哪边同步" */
-
-export const lineSet = (t) => new Set(String(t || '').split('\n').map((l) => l.trim()).filter(Boolean));
-
-export function lineDiff(a, b) {
-  const A = lineSet(a);
-  const B = lineSet(b);
-  return { memoryOnly: [...A].filter((l) => !B.has(l)), pageOnly: [...B].filter((l) => !A.has(l)) };
-}
-
-/**
- * 主干同步（2026-09-15 新增）：检查 / 修复 `_dsh_memory/MEMORY.md` 与知识页的共享章节。
- *
- * ⚠️ **默认只报告，绝不自动覆盖** —— 因为"不一致"的两个方向都可能正确：
- *    实测 faults.md 是 MEMORY 那边新（补了坑），environment.md 却是页面那边细（多了权限预设行），
- *    changelog.md 更是差 1000+ 字。盲目单向覆盖必然丢内容。
- *    因此覆盖必须显式给方向：`--apply --from memory|page`，且覆盖前自动备份。
- *    `only: ['faults.md']`（CLI `--only`）把一次覆盖限制在指定页 —— 方向按页不同时必须逐页跑。
- *
- * 非共享章节原封不动（如 environment.md 的 Whale 挂件、临时工具脚本；preferences.md 的"其他"）。
- * 待办不走这里 —— `todos.md` 是待办权威（带 `[x]` 语义，由 tidy 管理）。
- */
-
-export function pageBlocks(lines) {
-  const isSep = (l) => /^\s*\|[\s:|-]+\|\s*$/.test(l);
-  const headerIdx = new Set();
-  for (let i = 0; i < lines.length - 1; i++) if (isSep(lines[i + 1])) headerIdx.add(i);
-  const blocks = [];
-  let cur = null;
-  for (let i = 0; i < lines.length; i++) {
-    const l = lines[i];
-    const isRow = /^\s*\|/.test(l) && !isSep(l) && !headerIdx.has(i);
-    const isBullet = /^[-*]\s+\S/.test(l);
-    if (isRow || isBullet) {
-      if (cur) blocks.push(cur);
-      cur = { s: i, e: i };
-    } else if (cur && /^\s+\S/.test(l)) {
-      cur.e = i;                 // 缩进续行归上一块
-    } else if (cur) {
-      blocks.push(cur); cur = null;
-    }
-  }
-  if (cur) blocks.push(cur);
-  return blocks;
-}
+// ---------------------------------------------------------------- 文本工具
+// 2026-11-09 按域拆到 core-text.mjs —— 同上只转发，接口不变。
+export { fingerprint, STOP, isNoise, lineToText, cutText, stripFirstHeading, splitSections, SYNC_MAP, lineSet, lineDiff, pageBlocks } from './core-text.mjs';
 
 /** 列出某页（或全部页）的条目，附「已有的 i 评分 / 日期 / 长度」—— 给人工判断用 */

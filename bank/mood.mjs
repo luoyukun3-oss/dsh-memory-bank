@@ -25,15 +25,15 @@
 //   这是「事实通道权重恒为 0」在架构上的落点：情绪**进不了**事实检索池，不是靠自觉。
 // ============================================================================
 import path from 'node:path';
-import { clip, cutText, readJson, writeJson, zh } from './core.mjs';
+import { clip, readJson, writeJson, zh } from './core.mjs';
 import {
   MOOD_HISTORY_MAX, MOOD_WEIGHT_DEFAULT, MOOD_WEIGHT_NAMES,
-  isDangerWeight, moodBoostMax, moodBudget, parseMoodWeight,
+  isDangerWeight, moodBoostMax, moodBudget,
 } from './config-keys.mjs';
+import { currentMoodWeight, loadMoodConfig } from './mood-weight.mjs';
 
+// ---------------------------------------------------------------- 气氛状态（mood.json）
 const MOOD_FILE = 'mood.json';
-/** 权重档位的存放文件。与 `mood.json` 同级 ⇒ 同样落在 `pages/` 之外 ⇒ `recall` 也搜不到它。 */
-const MOOD_CONFIG_FILE = 'mood-config.json';
 
 const emptyMood = () => ({ schema: 1, updatedAt: null, current: null, history: [] });
 
@@ -51,57 +51,8 @@ export function loadMood(dir) {
 
 function saveMood(dir, m) { writeJson(path.join(dir, MOOD_FILE), m); return m; }
 
-// —— 权重档位（2026-10-13 用户要求：「只要一个情绪权重，后面有几个选项低/中/高」）——
-//    它是**配置**，不是气氛 ⇒ 另存 `mood-config.json`，不塞进 mood.json
-//    （后者会被 set/clear 反复重写，混在一起会让"调档位"看起来像"改气氛"）。
-//    与 mood.json 一样在 `pages/` 之外 ⇒ 档位本身也进不了事实检索池。
-
-/** 读档位。**任何异常都退化成默认档** —— 配置坏了不该让记忆银行停摆（与 loadMood 同策略）。 */
-function loadMoodConfig(dir) {
-  const c = readJson(path.join(dir, MOOD_CONFIG_FILE), null);
-  return {
-    schema: 1,
-    weight: parseMoodWeight(c && typeof c === 'object' ? c.weight : undefined),
-    updatedAt: (c && c.updatedAt) || null,
-  };
-}
-
-function saveMoodConfig(dir, cfg) { writeJson(path.join(dir, MOOD_CONFIG_FILE), cfg); return cfg; }
-
-/** 当前档位（最常用的一行）。 */
-export function currentMoodWeight(dir) { return loadMoodConfig(dir).weight; }
-
-/** 设置档位。认不出的值**直接拒写**（不像读那样退默认）—— 手滑打错要当场看见，别静默成"中档"。 */
-export function setMoodWeight(dir, level) {
-  const raw = String(level ?? '').trim();
-  const known = raw.toLowerCase() in MOOD_WEIGHT_NAMES
-    || Object.values(MOOD_WEIGHT_NAMES).includes(raw);
-  if (!known) {
-    throw new Error(`mood weight：认不出「${raw}」—— 可用：`
-      + Object.entries(MOOD_WEIGHT_NAMES).map(([k, n]) => `${k}(${n})`).join(' | '));
-  }
-  const w = parseMoodWeight(raw);
-  const cfg = loadMoodConfig(dir);
-  const changed = cfg.weight !== w;
-  cfg.weight = w;
-  cfg.updatedAt = new Date().toISOString();
-  saveMoodConfig(dir, cfg);
-  return { config: cfg, changed };
-}
-
-/** 档位速查（`cli mood weight` 不带参数时打印）。 */
-export function formatMoodWeightReport(level) {
-  const cur = parseMoodWeight(level);
-  const out = ['情绪权重档位（只影响「想起什么」的排序与气氛段占多少字，**不参与事实判断**）', ''];
-  for (const [k, name] of Object.entries(MOOD_WEIGHT_NAMES)) {
-    out.push(`  ${k === cur ? '●' : '○'} ${name}（${k}）　排序加权上限 +${moodBoostMax(k)}｜气氛注入配额 ${moodBudget(k)} 字`);
-  }
-  out.push('', `当前：**${MOOD_WEIGHT_NAMES[cur]}（${cur}）**`
-    + (cur === MOOD_WEIGHT_DEFAULT ? '（默认档）' : `（默认是「${MOOD_WEIGHT_NAMES[MOOD_WEIGHT_DEFAULT]}」）`));
-  out.push('改档位：`cli mood weight off|low|mid|high`（也认中文：关 / 低 / 中 / 高）');
-  out.push('⚠️ 任何档位都只改 `rank`（排序）—— **绝不进 `score`**（事实分），情绪永远顶不动相关性门槛。');
-  return out.join('\n');
-}
+// ---------------------------------------------------------------- 权重档位（已按域拆到 mood-weight.mjs，2026-11-09）
+export { currentMoodWeight, setMoodWeight, formatMoodWeightReport } from './mood-weight.mjs';
 
 /**
  * 只读快照（JSON 友好）——给界面/外部工具用，省得它们各自去拼 json 文件、拼错字段名。
@@ -233,60 +184,6 @@ export function clearMood(dir, { reason = '', evidence = '' } = {}) {
 }
 
 /**
- * 联想加权（权限表 ①）：**上限 +MOOD_BOOST_MAX**，且只对"当前气氛主题"命中的条目生效。
- *
- * ⚠️ 它返回的是**排序偏置**，不是分数 —— 调用方（search.mjs）必须把它加在 `rank` 上、
- *   **不能**加进 `score`：`score` 是事实通道（recall 的 minScore 门槛、hook 的注入触发都用它），
- *   一旦情绪进了 score，"相关性门槛"就被人情绕过去了。见 search.mjs 的接线注释。
- */
-export function moodBoost(entry, mood, level) {
-  const cur = mood?.current;
-  if (!cur || !(cur.intensity > 0)) return 0;
-  const themes = cur.themes || [];
-  if (!themes.length) return 0;
-  const hay = `${entry?.title || ''}\n${entry?.text || ''}`.toLowerCase();
-  const tags = (entry?.meta?.tags || []).map((t) => String(t).toLowerCase());
-  let hits = 0;
-  for (const th of themes) {
-    const w = String(th).toLowerCase();
-    if (!w) continue;
-    if (hay.includes(w) || tags.includes(w)) hits++;
-  }
-  if (!hits) return 0;
-  // 命中 2 个及以上主题即拿满，再乘强度 —— 两条上限相乘，仍在**当前档位**的
-  // `MOOD_BOOST_MAX`（默认档那个值）之内，有单测盯着。
-  const ratio = Math.min(1, hits / 2);
-  return moodBoostMax(level) * Math.min(1, cur.intensity) * ratio;
-}
-
-/** 注入段。空串＝不注入（没有气氛就一分预算都不占）。 */
-export function formatMoodNote(mood, level) {
-  const c = mood?.current;
-  if (!c) return '';
-  const w = parseMoodWeight(level);
-  // `off` 档＝**完全关掉情绪**：连气氛段都不注入（不是"注入得很短"）——
-  // 用户选「关」就是不想要它，没必要留一段还占预算的尾巴。
-  if (moodBudget(w) <= 0) return '';
-  const lines = [
-    `【当前气氛】（情绪系统 v2：只影响「想起什么」与「说话语气」，**不参与事实判断**、不作证据）`,
-    `· 现在：${c.label}${c.tone ? `（语气：${c.tone}）` : ''}｜能量 ${c.energy ?? 60}/100｜自 ${c.atText || c.at || '?'}｜强度 ${c.intensity}｜来源 ${c.source === 'user' ? '主人明说' : '我的判断'}`,
-    `· 证据：${c.evidence}`,
-  ];
-  // 低能量提示（2026-10-26 用户拍板）：低于 20 才说，别每轮都念。
-  // ⚠️ 措辞两边都钉住：允许「累」影响**篇幅与语气**（权限表③），
-  //    但**不许**拿它当降智/敷衍的挡箭牌（权限表②：结论只按事实走）。
-  if (typeof c.energy === 'number' && c.energy < 20) {
-    lines.push(`· ⚠️ 能量 ${c.energy}/100（见底）：说话可以更短、少开新岔子；但结论只按事实走，别拿「累」当降智或敷衍的挡箭牌。`);
-  }
-  // ⚠️ 档位行**故意排在证据之前**：低档只有 120 字配额，排在后面会被 cutText 截掉（测试盯过）。
-  lines.push(`· 权重档位：${MOOD_WEIGHT_NAMES[w]}（${w}）→ 改：\`cli mood weight 关|低|中|高\``);
-  if (c.themes?.length) lines.push(`· 联想加权主题（上限 +${moodBoostMax(w)}，只影响排序）：${c.themes.join('、')}`);
-  if (c.reason) lines.push(`· 上次改口理由：${c.reason}`);
-  lines.push('→ 改/清：`cli mood set --label X --evidence "原话" [--reason Y]`｜`cli mood clear --reason Y`');
-  return cutText(lines.join('\n'), moodBudget(w));
-}
-
-/**
  * 每轮收尾的能量微调（2026-10-26，用户要求「接进每轮收尾」）。
  *
  * ⚠️ **它刻意不走 `setMood`**：那两道护栏（无 evidence 拒写、改 label 必须给 reason）是防**改口**的，
@@ -320,30 +217,5 @@ export function tickEnergy(dir, { spend = 2, restPerHalfHour = 5 } = {}) {
   return { changed, from: prev, to: next, rest, spent: spend };
 }
 
-/** `cli mood` 的报告（渲染在这里、cli 只做调度 —— 先例：cue / dream / patch-status）。 */
-export function formatMoodReport(mood, level) {
-  const out = [];
-  const c = mood?.current;
-  const w = parseMoodWeight(level);
-  if (!c) {
-    out.push('当前气氛：（未设置 —— 没有气氛时联想加权为 0，注入里也不占预算）');
-  } else {
-    out.push(`当前气氛：**${c.label}**${c.tone ? `（语气：${c.tone}）` : ''}`);
-    out.push(`  自 ${c.atText || c.at}｜强度 ${c.intensity}｜能量 ${c.energy ?? 60}/100｜来源 ${c.source === 'user' ? '主人明说' : '我的判断'}${c.reason ? `｜改口理由：${c.reason}` : ''}`);
-    if (c.note) out.push(`  此刻：${c.note}`);
-    out.push(`  证据：${c.evidence}`);
-    if (c.themes?.length) out.push(`  联想加权主题：${c.themes.join('、')}（上限 +${moodBoostMax(w)}，只影响排序）`);
-  }
-  if (mood?.history?.length) {
-    out.push(`\n历史 ${mood.history.length} 条（近 5 条）：`);
-    for (const h of mood.history.slice(0, 5)) {
-      out.push(`  · ${h.atText || h.at} ${h.from ? `${h.from} → ` : ''}${h.label}`
-        + `${h.reason ? `｜理由：${h.reason}` : ''}${h.evidence ? `｜证据：${clip(h.evidence, 40)}` : '⚠️ 缺证据'}`);
-    }
-  }
-  out.push('\n⚠️ 边界：情绪**不进事实通道**（mood.json 在 pages/ 之外 ⇒ recall 搜不到），联想加权上限 +'
-    + `${moodBoostMax(w)} 且只改排序、不改 score。`);
-  out.push(`权重档位：**${MOOD_WEIGHT_NAMES[w]}（${w}）**｜气氛段配额 ${moodBudget(w)} 字`
-    + `　→ 调档：\`cli mood weight off|low|mid|high\``);
-  return out.join('\n');
-}
+// ---------------------------------------------------------------- 出口（已按域拆到 mood-render.mjs，2026-11-09）
+export { moodBoost, formatMoodNote, formatMoodReport } from './mood-render.mjs';

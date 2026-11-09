@@ -10,19 +10,29 @@
  */
 
 /** 开场注入总预算（字）。超出后按段从尾部截断，见 bootstrap.mjs 的 SEG_BUDGET。 */
-export const INJECT_BUDGET = 8000;
+export const INJECT_BUDGET = 8000;   // 区间 [4000,32000] 依据：SEG_BUDGET 三段核心合计 4000；实测注入 7144
 
 /**
- * 主注入触发的最小检索分。标定史：1.2 → 1.5（2026-09-17）—— 起因不是检索变差，
- * 而是**噪声地板随知识库增长上漂**（0.64 → 0.79，1.2 的余量掉到 1.5×；经验上低于 2× 该警惕）。
+ * 主注入触发的最小检索分。标定史：
+ *   1.2 → 1.5（2026-09-17）—— 起因不是检索变差，而是**噪声地板随知识库增长上漂**
+ *     （0.64 → 0.79，1.2 的余量掉到 1.5×；经验上低于 2× 该警惕）。
+ *   1.5 → **1.2**（2026-11-08）—— 方向**反过来**了：`index.json` 去重后文档数 2288 → 1056，
+ *     而 `idfOf = log(1 + N/df)` 里 N 变小 ⇒ **所有词 idf 整体下降** ⇒ 同样内容的分数整体变小。
+ *     实测：阈值 1.5 时相关提问只触发 **11/18**（卡掉 1.25~1.49 的 7 条），
+ *     而 1.2 与 1.0 都是 **18/18 触发、0/8 误触发**（无关组最高 0.86）。
+ *   ⚠️ **这条标定史真正的教训：阈值是绝对值，而分数的标度跟着索引规模漂。**
+ *     索引每增删一批文档，这个值就**悄悄失效一次**，症状是「召回突然变少」，极难归因
+ *     （2026-11-08 当天差点被归因成「⑬ 改坏了检索」）。
+ *     ⇒ 所以本次同时在 `test.mjs` 加了守护（余量 < 1.3× 或相关触发 < 14/18 即失败），
+ *       把「标定失效」从「靠人记得去看」变成「红了就说」。
  * 改这个值前先读 `recall-eval.mjs` 的阈值体检表。
  * 样本对照（2026-09-15，27 条：相关 19 / 无关 8）：阈值 3.0 → 相关 2/19；1.2 → 11/19；1.0 → 13/19；
  * 无关组最高仅 0.40 ⇒ 1.2 有约 3× 余量。阈值只决定**触发频率**，不改单次注入字数（都贴 budget 上限）。
  */
-export const INJECT_MIN_SCORE = 1.5;
+export const INJECT_MIN_SCORE = 1.2;
 
 /** 跨会话交接（2026-09-22 用户拍板）：保留上一会话**最后几轮**。5 轮＝够接上上下文又不挤预算。 */
-export const HANDOFF_TURNS = 5;
+export const HANDOFF_TURNS = 5;   // 区间 [1,10] 依据：0 轮＝关功能；620 字预算装不下 10 轮以上
 
 /** handoff 段的注入预算（字）＝**渲染出来的那一段**（含段标题与 `→ 详情` 行）。
  *  标定史：实测 429 → 472 → **549**（2026-09-22 一晚三次，因为最近几轮我自己回复变长了）⇒ 定 **620**。
@@ -31,11 +41,11 @@ export const HANDOFF_TURNS = 5;
  *  ⚠️ **「整段」这三个字是这轮修出来的（2026-10-10）**：`formatHandoff` 只保证**轮次正文** ≤ 本值，
  *  头尾壳（约 140 字）原先两头都不管 ⇒ 正文一顶满整段就冲到 633（此后 test 时红时绿，取决于上一会话话多话少）。
  *  现在由 `bootstrap.mjs` 扣壳长（含 cutText 的截断标记余量）兜住整段，测试另有**构造数据**的确定性断言。 */
-export const HANDOFF_CHARS = 620;
+export const HANDOFF_CHARS = 620;   // 区间 [280,3000] 依据：头尾壳 140 + 正文兜底 120 ⇒ 构造下限 260
 
 /** 退化审计只扫最近几个会话文件、只最近多少小时（sweep 要快）。 */
-export const DEGEN_MAX_FILES = 4;
-export const DEGEN_WINDOW_H = 48;
+export const DEGEN_MAX_FILES = 4;    // 区间 [1,50] 依据：至少扫 1 个；全库 271 个会话文件，扫全库会慢
+export const DEGEN_WINDOW_H = 48;    // 区间 [1,720] 依据：1 小时 ~ 30 天（sweep 要快）
 
 /**
  * 碎片复读判据（坡面二型，2026-10-08 新增）—— **回放标定出来的值，别再凭感觉改**。
@@ -44,8 +54,8 @@ export const DEGEN_WINDOW_H = 48;
  * 该组合下命中 5 个会话文件、**全是真复读**（「好」×757、×216、×132，「写」×93），其余 80 个文件 0 命中。
  * ⚠️ 单独放宽任一条都会掉进虚警：单看 repeat≥10 会命中 457 步（技术词与代码片段的正常机械重复）。
  */
-export const FRAG_MIN_CHARS = 400;
-export const FRAG_RATIO_MIN = 0.20;
+export const FRAG_MIN_CHARS = 400;   // 区间 [50,10000] 依据：判据「思考 ≥ N 字」，太小会把正常短思考算进去
+export const FRAG_RATIO_MIN = 0.20;  // 区间 [0.01,1] 依据：它是比例，0 会让任何一步都命中
 
 /**
  * 自促词复读阈值（坡面三型，2026-11-02 新增）—— 上面那条的补丁，**回放标定过，别再凭感觉改**。
@@ -57,7 +67,7 @@ export const FRAG_RATIO_MIN = 0.20;
  *   另 6 个只命中 1 步（正常口癖量级）。技术噪声（`</p`×36、`go.`、`code:`）因不在自促词表内被天然挡掉。
  * ⚠️ 取 10 而不是 8：8 时同一批 16 个会话只多出步数、不新增会话 ⇒ 没有更早发现，只多噪声。
  */
-export const SELF_REPEAT_MIN = 10;
+export const SELF_REPEAT_MIN = 10;   // 区间 [2,100] 依据：重复 ≥2 是「重复」的最小语义
 
 /**
  * 触发式联想（cue，2026-10-13 新增）—— **全部是拿真库回放标定出来的，别再凭感觉改**。
@@ -68,25 +78,27 @@ export const SELF_REPEAT_MIN = 10;
  * ⚠️ 注意：改这组值要连**两个模式**一起想 —— output 模式（工具输出，动辄几 KB 文本）
  * 只认 cue 档，prompt 模式才三档全开，理由见 cue.mjs 头注释。
  */
-export const CUE_DF_MAX = 0.08;
+export const CUE_DF_MAX = 0.08;   // 区间 [0.01,0.5] 依据：df 是比例；0.5 ＝ 半个库都算泛词
 /** `output` 模式（工具输出）额外的**词筛**：库内 df 高于本值的词在工具输出里一律不触发。
  *  标定（2026-10-13，500 条真实 tool/result 回放）：初版命中率 **55%** —— 太高；元凶是
  *  `write` 16.6% / `hook` 16.8% / `window` 11.2% 这类**我自己工作领域的高频词**，取 5% 全挡住，
  *  同时保住了用户的例词（乱码 2.8% / GBK 1.2% / BOM 2.8%）。⚠️ 对 `cue:` 也生效（那才是"人工
  *  标注"该守的底线：挑的是"你会看到的那串原文"，不是"我常说的词"）；prompt 模式不受影响。 */
-export const CUE_DF_MAX_OUTPUT = 0.05;
-export const CUE_MIN_LEN = 2;
-export const CUE_MAX_LEN = 8;
+export const CUE_DF_MAX_OUTPUT = 0.05;   // 区间 [0.01,0.5] 且必须 < CUE_DF_MAX（交集区间，test.mjs 第 26 节）
+export const CUE_MIN_LEN = 2;   // 区间 [2,8] 依据：test.mjs 断言单字不触发 ⇒ 下界只能是 2
+export const CUE_MAX_LEN = 8;   // 区间 [2,100] 且必须 ≥ CUE_MIN_LEN
 /** `cue:` 档的长度上限（比标签宽）：它可以是**一整段报错原文**（如 `has not been read`）。
  *  注释按空白切分 ⇒ 原文里的空格写 `+`（buildCueTable 还原），故本值按还原后的长度算。 */
-export const CUE_MAX_LEN_CUE = 30;
+export const CUE_MAX_LEN_CUE = 30;   // 区间 [2,200] 且必须 ≥ CUE_MAX_LEN（cue 档按设计比标签宽）
 // cue 注入的两级名额（2026-10-26 重做：原来 `CUE_MAX_HITS=2` 是**假名额** —— 每条「标题 44 +
 // 正文 180」≈224 字而 `CUE_BUDGET` 只有 240，实测第 2 条永远进不来、第 1 条还被砍在「修法」之前）。
 // 现在：扫 8 条 → 概率打分 → 1 条带正文（判断权回交推理，其余只给路牌）。
-export const CUE_MAX_HITS = 8, CUE_BODY_HITS = 1, CUE_MAX_ROADS = 4;
+export const CUE_MAX_HITS = 8;     // 区间 [1,50] 依据：扫多少条候选，至少 1
+export const CUE_BODY_HITS = 1;    // 区间 [0,8] 且 ≤ CUE_MAX_HITS（0 ＝ 全部只给路牌）
+export const CUE_MAX_ROADS = 4;    // 区间 [0,20] 依据：路牌每条约 28 字（cue-render.mjs）
 /** cue 段预算（240 → 320）：正文 ≈ 190 + 路牌 4×28。 */
-export const CUE_BUDGET = 320;
-export const CUE_ENTRY_CHARS = 180;
+export const CUE_BUDGET = 320;        // 区间 [100,2000] 依据：≈ 正文 190 + 路牌 4×28
+export const CUE_ENTRY_CHARS = 180;   // 区间 [40,1000] 依据：pickActionable 的截断长度，要装下一句可执行结论
 
 /**
  * 情绪系统 v2（mood，2026-10-13；权限表见 decisions.md:8）。
@@ -95,7 +107,7 @@ export const CUE_ENTRY_CHARS = 180;
  * （这里曾经还有 5 个「审计」相关的键：扫会话日志算「压力轮 → 改口率」。当天就删了 ——
  *   那份统计采样的是**用户自己的话**，对象错了，理由见 mood.mjs 头注释。）
  */
-export const MOOD_HISTORY_MAX = 30;      // 气氛历史保留条数（软遗忘：只留最近）
+export const MOOD_HISTORY_MAX = 30;      // 气氛历史保留条数（软遗忘：只留最近）｜区间 [1,500]
 
 /** 情绪权重档位（2026-10-13 用户：「只要一个情绪权重，后面有几个选项低/中/高」）——
  *  **一个旋钮同时缩放内部两个数**。三条守线：① 本表是唯一真值（`MOOD_BOOST_MAX` / `MOOD_BUDGET`
@@ -110,7 +122,8 @@ export const MOOD_HISTORY_MAX = 30;      // 气氛历史保留条数（软遗忘
  *    · **气氛段提前注入**（提到【全局偏好】之后）⇒ 它从"读完事实后的补充"变成"读事实前的定调"，
  *      这是典型 priming —— 所以段头必须打危险标记（见 mood.mjs 的 formatMoodNote）；
  *    · **写气氛可以不带 `--evidence`**（普通档仍然拒写）⇒ 裸写的每条都打 `unsafe: true` 留痕。
- *  ⚠️ **不破的那条**：`score`（事实分）在任何档位下**一个字都不许变** —— 极限档也只是排得靠前。 */
+ *  ⚠️ **不破的那条**：`score`（事实分）在任何档位下**一个字都不许变** —— 极限档也只是排得靠前。
+ *  区间（6 档共用同一域）：`boost` ∈ [0,1]、`budget` ∈ [0,480]，依据见 config-clamp.mjs 的 MOOD_RANGES。 */
 export const MOOD_WEIGHTS = {
   off:     { boost: 0,    budget: 0   },   // 关：不排序、不注入（等于关掉整套情绪）
   low:     { boost: 0.07, budget: 120 },

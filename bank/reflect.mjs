@@ -2,9 +2,10 @@
 // Memory Bank · reflect —— 从 bank.mjs 拆出（2026-09-22）
 //   ⚠️ 本文件**不许 import bank.mjs**（那会循环依赖）；只依赖 node 标准库 + ./core.mjs + 同层模块。
 // ============================================================================
-import { clip, day, isNoise, lineToText, loadAliases, nowIso, readJson, readText, tokenize, writeJson, writeText, zh } from './core.mjs';
-import { search } from './search.mjs';
+import { clip, day, lineToText, loadAliases, nowIso, readJson, readText, writeJson, writeText, zh } from './core.mjs';
 import { renderNegSection, scanNegFeedback } from './reflect-neg.mjs';
+import { openClues } from './reflect-clues.mjs';          // 未闭环事项（2026-11-09 按域拆出）
+import { lessonCandidates } from './reflect-cand.mjs';   // 教训候选（2026-11-09 按域拆出）
 import { pushNegToInbox } from './neg-inbox.mjs';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -71,68 +72,12 @@ export function reflect(dir, { days = 7 } = {}) {
   // 按「超限先按域拆分」的规矩单独立模块。这里只取结果，落盘渲染同样交给它。
   const negCandidates = scanNegFeedback(userTexts);
 
-  // 四之权威清单（2026-09-15 修复误报）：真待办看 `pages/todos.md` 里未勾选的项
-  const todoOpen = [];
-  for (const line of readText(path.join(dir, 'pages', 'todos.md')).split('\n')) {
-    const m = line.match(/^\s*[-*]\s+\[ \]\s+(.+?)\s*$/);
-    if (m) todoOpen.push(clip(m[1], 130));
-  }
-  // 四之线索：用户原话里的关键词命中。排除 ①元问题（"还有什么要做"这类提问）
-  // ②已闭环信号 ③与**某一条**已归档事项高度重合的（逐条比对，避免被整个归档文件的 token 池稀释）
-  const DONE_RE = /(已经|已完成|搞定了|解决了|弄好了|可以了|装上了|通过了|删掉了|给了|好了)/;
-  const META_Q = /(还有什么|是什么|是干嘛|什么意思|怎么弄|有没有什么)/;
-  const archItems = readText(path.join(dir, 'pages', 'todos-archive.md'))
-    .split('\n')
-    .filter((l) => /^\s*[-*]\s*\[[xX]\]/.test(l))
-    .map((l) => new Set(tokenize(l)));
-  const openEnds = [];
-  for (const l of userTexts) {
-    if (!/还没|下次|待办|等几天|回头|以后再/.test(l)) continue;
-    if (META_Q.test(l) || DONE_RE.test(l)) continue;
-    const tk = [...new Set(tokenize(l))].filter((t) => !isNoise(t));
-    if (tk.length) {
-      let best = 0;
-      for (const s of archItems) {
-        const hit = tk.filter((t) => s.has(t)).length;
-        if (hit / tk.length > best) best = hit / tk.length;
-      }
-      if (best >= 0.4) continue;   // 与某条已归档事项高度重合 → 视为已闭环
-    }
-    openEnds.push(l);
-  }
-  const openEndClues = openEnds.slice(-6);
+  // 四、未闭环事项（2026-11-09 按域拆出 → ./reflect-clues.mjs，判据与注释随代码一起搬走）
+  //   ① 权威清单 = `pages/todos.md` 未勾选项 ② 线索 = 用户原话关键词命中（已排除"已完成"信号与已归档重复项）
+  const { todoOpen, openEndClues } = openClues(dir, userTexts);
 
-  // 五、教训候选（2026-09-15 重做）：原先 = 「高频话题的子集」，于是跟第一节输出同一堆二元组碎片，
-  // 白白占掉一整节。改成**有判据的问题**：某个主题最近反复出现，但 `lessons.md` 里**还没记过它**。
-  // 判「记没记过」用**检索**而不是字面 `includes` —— 字面匹配会被同义说法骗（lessons 里写的是
-  // "三角形"/"记忆系统"，别名组的词却是"三角形类型判断"/"记忆银行"，字面不中就误报）。
-  // 先用 20 条再筛 `lessons.md`：直接坐 `recall(k=3)` 会被 meta/decisions 这类页面挤掉。
-  // 阈值 1.2 来自实测分布（2026-09-15）：≥1.8 全是真相关（range 5.57 / 数字输入容错 8.44 /
-  // 三角形 3.85），≤0.8 基本是噪声命中（0.72 撞上"hook 命令必须是 PowerShell 语法"这种无关条目）。
-  // 判错的代价用**透明度**兜住：不论判哪边，都把「最接近的条目 + 分数」打出来，能看见证据。
-  const KNOWN_MIN = 1.2;
-  const candidates = [];
-  const coveredThemes = [];
-  for (const [label, n] of themes) {
-    const top = search(dir, label, 20).filter((h) => h.page === 'lessons.md')[0];
-    const known = !!top && top.score >= KNOWN_MIN;
-    const near = top ? `${clip(String(top.title).replace(/[*`]/g, ''), 26)}（${top.score.toFixed(2)}）` : '无';
-    if (known) coveredThemes.push(`${label} ← ${near}`);
-    else if (n >= 2) candidates.push([label, n, near]);
-  }
-
-  // 候选的「已处理」勾选状态（2026-09-15）：反思写了没人消费，同一批候选就会一天天重复。
-  // 上一次反思里已划 `[x]` 的候选会被沿用，不再重复提醒。
-  const doneTokens = new Set();
-  try {
-    const rdir = path.join(dir, 'reflections');
-    const prevFiles = fs.readdirSync(rdir).filter((f) => f.endsWith('.md')).sort();
-    if (prevFiles.length) {
-      const prev = readText(path.join(rdir, prevFiles[prevFiles.length - 1]));
-      const sec5 = prev.split('## ').find((s) => s.startsWith('五、')) || '';
-      for (const m of sec5.matchAll(/^\s*-\s*\[[xX]\]\s*`([^`]+)`/gm)) doneTokens.add(m[1]);
-    }
-  } catch { /* 读不到旧反思不影响本次生成 */ }
+  // 五、教训候选（2026-11-09 按域拆出 → ./reflect-cand.mjs：判据、阈值标定、勾选沿用都随代码搬走）
+  const { candidates, coveredThemes, doneTokens } = lessonCandidates(dir, themes);
 
   const out = [];
   out.push(`# 深度反思 ${day()}（最近 ${days} 天内 · ${userTexts.length} 条用户消息 · ${files.length} 个流水文件）`);

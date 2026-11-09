@@ -1,5 +1,5 @@
 /**
- * 召回评测（常驻）：`node E:\2\_dsh_memory\bank\recall-eval.mjs`
+ * 召回评测（常驻）：`node bank/recall-eval.mjs`
  *
  * 为什么要有它（2026-09-15 踩过）：
  * 「加一条记录」会**改变整个检索生态** —— 写教训时逐字引用了用户的查询原句，
@@ -15,6 +15,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { repoDir, search, recall, reindexPage, ARCHIVED_PAGES } from './bank.mjs';
 import { INJECT_MIN_SCORE } from './config-keys.mjs';
+import { checkHookThreshold, thresholdProblems, SAFE } from './hook-threshold.mjs';   // 阈值体检唯一实现（2026-11-08）
 
 const dir = repoDir(process.env.BANK_SLUG || 'e-2');
 
@@ -79,39 +80,29 @@ for (const [q] of CASES) {
 // —— hook 阈值体检（2026-09-15 加）——
 // 每次要调 `hooks/user-prompt.mjs` 的 MIN_SCORE 时重跑这里：看"相关提问触发率"与"无关提问误触发"。
 // 判据：**无关提问的最高分**就是噪声地板，阈值必须明显高于它。
+// ⚠️ 2026-11-08 改：计算**抽到 hook-threshold.mjs**（单一实现，test.mjs 第 32 节共用同一份）。
+//   旧版这里内联的 sim() 有个 bug：`recall(dir, q, { k: 4, budget: 1100 })` **漏了 withGlobal:false**，
+//   而 hook 真实调用带它 ⇒ 测出来的「平均注入字数」虚高 400 字（不影响 score，但那是失真数据）。
 const HOOK_THR = INJECT_MIN_SCORE;   // ← 取自 config-keys.mjs（不再靠注释人肉对齐）
-const RELATED = [
-  '我网页上点按钮没动静', '页面点不动', '上不了网', '网页打不开',
-  '记忆没更新', '改了没生效', '插件装不上', 'hook 报错',
-  '脚本执行不了', '脚本找不到文件', '日志打不开', '网络怎么了',
-  '电脑变慢 界面发钝 风扇一直响', '循环次数不能填小数',
-  '成考什么时候报名', '上次改权限改成什么了',
-  '怎么委婉地推掉老师的邀约', '摸鱼模式怎么开', '为什么老是弹窗问我要不要允许',
-];
-const IRRELATED = ['今天天气怎么样', '一加一等于几', '帮我写一首诗', '随便聊聊天吧', '哈哈哈哈', '好的我知道了', '嗯嗯', '谢谢你'];
+import { RELATED, IRRELATED } from './eval-cases.mjs';   // 样例抽到独立纯数据文件（2026-11-08，test 第 28 节要 import）
 
-const sim = (q, thr) => {
-  const { hits, text } = recall(dir, q, { k: 4, budget: 1100 });
-  const strong = hits.filter((h) => h.score >= thr);
-  return { fire: strong.length > 0, len: strong.length ? text.length : 0 };
-};
-const relTop = RELATED.map((q) => recall(dir, q, { k: 5, minScore: 0 }).hits[0]?.score || 0);
-const irrTop = IRRELATED.map((q) => recall(dir, q, { k: 5, minScore: 0 }).hits[0]?.score || 0);
+const thrScan = [0.5, 0.8, 1.0, 1.2, 1.5, 2.0, 3.0].map((thr) => checkHookThreshold(dir, { related: RELATED, irrelated: IRRELATED, thr }));
+const cur = thrScan.find((r) => r.thr === HOOK_THR) || checkHookThreshold(dir, { related: RELATED, irrelated: IRRELATED });
 
 lines.push('');
 lines.push(`### hook 阈值体检（当前 MIN_SCORE = ${HOOK_THR}）`);
 lines.push('');
 lines.push('| 阈值 | 相关提问触发 | 无关提问误触发 | 平均注入字数 |');
 lines.push('|---|---|---|---|');
-for (const thr of [0.5, 0.8, 1.0, 1.2, 1.5, 2.0, 3.0]) {
-  const rel = RELATED.map((q) => sim(q, thr));
-  const irr = IRRELATED.map((q) => sim(q, thr));
-  const fired = rel.filter((r) => r.fire);
-  const avg = fired.length ? Math.round(fired.reduce((a, b) => a + b.len, 0) / fired.length) : 0;
-  lines.push(`| ${thr}${thr === HOOK_THR ? ' ←当前' : ''} | ${fired.length}/${rel.length} | ${irr.filter((r) => r.fire).length}/${irr.length} | ${avg} |`);
+for (const r of thrScan) {
+  lines.push(`| ${r.thr}${r.thr === HOOK_THR ? ' ←当前' : ''} | ${r.relatedFired}/${r.relatedTotal} | ${r.irrFired}/${r.irrTotal} | ${r.avgChars} |`);
 }
 lines.push('');
-lines.push(`噪声地板 = 无关提问最高分 **${Math.max(...irrTop).toFixed(2)}**（阈值应明显高于它）｜当前阈值余量 ${(HOOK_THR / Math.max(0.01, Math.max(...irrTop))).toFixed(1)}×`);
-lines.push(`相关提问分数：${relTop.map((s) => s.toFixed(2)).sort((a, b) => b - a).join(', ')}`);
+lines.push(`噪声地板 = 无关提问最高分 **${cur.noiseFloor.toFixed(2)}**（阈值应明显高于它）｜当前阈值余量 ${cur.margin.toFixed(1)}×`);
+lines.push(`相关提问分数：${cur.relatedTop.map((s) => s.toFixed(2)).sort((a, b) => b - a).join(', ')}`);
+// —— 安全区报警（2026-11-08 加）—— 阈值是绝对值、分数标度跟着索引规模漂，所以每次体检都明说健不健康。
+const probs = thresholdProblems(cur);
+lines.push('');
+lines.push(probs.length ? `⚠️ **阈值标定已失效**：${probs.join('；')}` : `✅ 阈值标定在安全区内（余量 ≥ ${SAFE.MIN_MARGIN}×、相关触发 ≥ 14/18）`);
 
 console.log(lines.join('\n'));

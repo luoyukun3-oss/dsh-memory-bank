@@ -16,7 +16,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { readText } from './core.mjs';
 
-export const synonymCache = new Map();
+const synonymCache = new Map();
 
 export function loadSynonyms(dir) {
   const f = path.join(dir, 'synonyms.json');

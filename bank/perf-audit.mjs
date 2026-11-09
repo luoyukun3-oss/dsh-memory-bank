@@ -1,7 +1,7 @@
 // 性能打点 + 内存判据（bank/perf-audit.mjs，2026-09-21）
 // ============================================================
 // 背景：这是待办「性能与资源治理（借 dsh-pet）」的 ①②。⚠️ **但原始清单已失传** ——
-// `todos.md` 里只留下「打点与内存判据照做」一句、细节区没记，`E:\2` 里也没有 dsh-pet
+// `todos.md` 里只留下「打点与内存判据照做」一句、细节区没记，工作区里也没有 dsh-pet
 // 的抓取文件（当初读完直接用了，没落盘）。所以 2026-09-21 按**我们自己的场景重新定义**，
 // 原则只有一条：**能真的用起来**。
 //
@@ -20,6 +20,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { writeText } from './core.mjs';   // 原子写唯一实现（2026-11-08）
 
 const MEM_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));   // bank/ → _dsh_memory/
 const STATE_DIR = path.join(MEM_ROOT, 'state');
@@ -32,12 +33,11 @@ function readPerf() {
   try { return JSON.parse(fs.readFileSync(PERF_FILE, 'utf8')); } catch { return { runs: [] }; }
 }
 
-/** 原子写（先临时文件再 rename），避免写一半把文件毁了。 */
+/** 原子写（2026-11-08 起复用 core 的 `writeText`，不再自己实现）。
+ *  原实现是这里的 4 行 tmp+rename，但**没有失败清理** ⇒ 进程被杀就留 `perf.json.tmp-<pid>` 垃圾
+ *  （实测 `state/` 里躺着 3 个）。core 的 writeText 有 try/catch 清理，且是全库唯一实现。 */
 function writePerf(data) {
-  fs.mkdirSync(STATE_DIR, { recursive: true });
-  const tmp = `${PERF_FILE}.tmp-${process.pid}`;
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 1), 'utf8');
-  fs.renameSync(tmp, PERF_FILE);
+  writeText(PERF_FILE, JSON.stringify(data, null, 1));   // 缩进仍用 1，别改文件格式
 }
 
 // ── ① 打点：import 即生效，进程退出时记一笔 ────────────────────────────────

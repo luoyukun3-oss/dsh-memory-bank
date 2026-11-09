@@ -12,13 +12,34 @@
 //   ③ **失败不抛**：tick 的 step() 会兜，但这里也自己兜一层 —— 记账模块不该拖垮收尾流程。
 //   ④ **不写 md**：只进库。md 是"人读的叙事"，库是"机器查的结构"，两者先不要互相污染。
 // ============================================================================
-import { findTranscripts, readRecords, textOf } from './core.mjs';
+import { findTranscripts, readRecords, readJson, writeJson, textOf } from './core.mjs';
 import { linkEntities, openDb } from './evstore.mjs';
+import fs from 'node:fs';
+import path from 'node:path';
 
 const clip = (s, n) => {
   const t = String(s || '').replace(/\s+/g, ' ').trim();
   return t.length <= n ? t : t.slice(0, n) + '…';
 };
+
+/**
+ * ev 的指纹判断（抽成纯函数，便于测试）。
+ * ⚠️ **独立于 ingest 的 `state.stamps`**：ingest 跑在 ev 前面会抢先更新那个键，
+ *   共用的话 ev 第一次就误判「已抽过」、事件永远不落库（2026-11-09 真实踩到）。
+ *   ev 用自己的 `state/ev-stamp.json`，键 = 会话目录名，值 = `size:mtimeMs`。
+ * @returns {{skip:boolean, fp:string|null, key:string}}
+ */
+export function evShouldSkip(dir, file) {
+  const key = path.basename(path.dirname(file));
+  let st;
+  try { st = fs.statSync(file); } catch { return { skip: false, fp: null, key }; }
+  const fp = `${st.size}:${st.mtimeMs}`;
+  try {
+    const evStamps = readJson(path.join(dir, 'state', 'ev-stamp.json'), {});
+    if (evStamps[key] === fp) return { skip: true, fp, key };
+  } catch { /* 读不到就当没跳过 */ }
+  return { skip: false, fp, key };
+}
 
 const slotOf = (d) => {
   const h = d.getHours();
@@ -39,7 +60,14 @@ export function autoLogEvent(dir, { cwd, maxTools = 6, maxChars = 60 } = {}) {
   try {
     const files = findTranscripts(cwd || process.cwd());
     if (!files.length) return { ok: false, reason: '没有找到会话日志' };
-    const recs = readRecords(files[0].file);
+    // —— 指纹跳过（2026-11-09，A 组调研实测）：ev 和 ingest **同款病** ——
+    //   同一份最新日志一轮 tick 被解压两次（ingest 先解、ev 再解，实测 140ms）。
+    //   指纹判断抽在 `evShouldSkip`（纯函数，独立于 ingest 的 state.stamps）。
+    const file = files[0].file;
+    const chk = evShouldSkip(dir, file);
+    if (chk.skip) return { ok: true, skipped: true, reason: '事件已抽取（文件没变），跳过解压' };
+    const fp = chk.fp;
+    const recs = readRecords(file);
     if (!recs.length) return { ok: false, reason: '会话日志为空' };
 
     // ⚠️ 会话里 user/message 的形状是 `data:{role, content, source}`，**不是** `data.message.content`
@@ -98,6 +126,14 @@ export function autoLogEvent(dir, { cwd, maxTools = 6, maxChars = 60 } = {}) {
       const inserted = Number(info.changes || 0) > 0;
       // 2026-10-29：补上实体关联 —— 此前只写 events，`event_entities` 从 10-26 起全是 0。
       const entities = inserted ? linkEntities(db, id, brief) : 0;
+      // 抽取成功才记指纹（2026-11-09）：下次文件没变就跳过解压。失败不写 ⇒ 下次照常重试。
+      if (fp) {
+        try {
+          const evStamps = readJson(path.join(dir, 'state', 'ev-stamp.json'), {});
+          evStamps[chk.key] = fp;
+          writeJson(path.join(dir, 'state', 'ev-stamp.json'), evStamps);
+        } catch { /* 记不上指纹只是下次多解压一次，不拖垮 */ }
+      }
       return { ok: true, inserted, entities, event: { id, day, slot: slotOf(at), brief } };
     } finally {
       try { db.close(); } catch {}

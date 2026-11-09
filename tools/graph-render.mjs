@@ -16,10 +16,17 @@
 // ============================================================================
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+// 连边指令的**唯一实现**（2026-11-09）：这套源码既内联进页面，也被 bank/test-graph-edit.mjs
+// 用 new Function 求值做断言 —— 一份实现两处执行，避免"页面一份、测试一份"的漂移。
+import { EDIT_LIB_SRC, EDIT_REL_TYPES, EDIT_REL_TYPE_HINTS } from './graph-edit-lib.mjs';
 
 const repo = process.argv[2] || 'E:/2/_dsh_memory/repos/e-2';
 const outFile = process.argv[3] || path.join(repo, 'graph.html');
 const CO_MIN = Number(process.argv[4] || 80);
+// 连边命令要用的两个绝对路径（转成正斜杠：粘进 PowerShell / bash 都不用改）
+const REL_APPLY = path.join(path.dirname(fileURLToPath(import.meta.url)), 'rel-apply.mjs').replace(/\\/g, '/');
+const REPO_ABS = path.resolve(repo).replace(/\\/g, '/');
 
 const readJson = (p) => JSON.parse(fs.readFileSync(p, 'utf8'));
 const idx = readJson(path.join(repo, 'index.json'));
@@ -103,6 +110,9 @@ const data = {
   meta: {
     builtAt: new Date().toISOString().slice(0, 19).replace('T', ' '),
     repo: path.basename(repo),
+    // 连边面板要用：工具绝对路径 + 仓库绝对路径（页面不能写文件，但可以生成一条能粘进终端的命令）
+    toolPath: REL_APPLY,
+    repoPath: REPO_ABS,
     coMin: CO_MIN,
     docs: byId.size,
     itemNodes: itemNodes.length,
@@ -140,15 +150,38 @@ const html = `<!DOCTYPE html>
     padding:1px 6px;margin:2px 3px 0 0;font-size:11px}
   #legend{position:fixed;left:16px;bottom:14px;color:var(--dim);font-size:11px;line-height:1.7}
   .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px}
+  /* —— 连边面板（2026-11-09）：点两个节点 → 选类型 → 生成可粘贴的指令 —— */
+  #pickbar{position:fixed;left:50%;transform:translateX(-50%);bottom:14px;z-index:9;display:none;
+    background:#11151df2;border:1px solid #2d3b55;border-radius:10px;padding:10px 14px;
+    font-size:12px;min-width:min(680px,92vw);max-width:92vw;backdrop-filter:blur(8px)}
+  #pickbar .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  #pickbar .row .lbl{color:var(--dim)}
+  #pickbar button{background:#151a24;color:#cfd6e6;border:1px solid var(--line);border-radius:6px;
+    padding:4px 10px;font-size:12px;cursor:pointer}
+  #pickbar button:hover{background:#1d2637}
+  #pickbar button.on{background:#243b2b;border-color:#3f7a52;color:#b8f0c8}
+  #pickbar button.warn{color:#f0c674;border-color:#5a4a25}
+  #pairlist{margin-top:8px;max-height:24vh;overflow:auto}
+  #pairlist .p{display:flex;justify-content:space-between;gap:10px;padding:2px 0;color:#cfd6e6}
+  #pairlist .p .k{color:#8a90a6}
+  #pairlist .p button{padding:1px 7px;font-size:11px}
+  #cmdbox{width:100%;margin-top:6px;background:#0b0d12;color:#9fe0b0;border:1px solid var(--line);
+    border-radius:6px;padding:6px 8px;font:11px/1.5 Consolas,monospace;resize:vertical}
+  #pickbar .hint{color:#f0c674;margin-top:6px}
+  #pickbar .dim{color:var(--dim);margin-top:6px}
 </style></head><body>
 <canvas id="c"></canvas>
 <div id="hud"><h1>记忆银行 · 联想图谱</h1>
   <div class="sub" id="stat"></div></div>
 <div id="tabs"><button id="tPage" class="on">页面骨架</button><button id="tItem">条目细节</button></div>
 <div id="panel"></div>
+<div id="pickbar"></div>
 <div id="legend"></div>
 <script>
+${EDIT_LIB_SRC}
 const DATA = ${JSON.stringify(data)};
+const GEREL_TYPES = ${JSON.stringify(EDIT_REL_TYPES)};
+const GEREL_HINTS = ${JSON.stringify(EDIT_REL_TYPE_HINTS)};
 const PAGE_COLORS = {};
 const PALETTE = ['#6ea8fe','#f7a1c4','#7ee0b8','#f0c674','#b39ddb','#8fd3f4','#e6a0a0','#a5d6a7','#ffb74d','#90caf9'];
 let pi = 0;
@@ -169,6 +202,8 @@ let mode = 'page';            // 'page' | 'item'
 let nodes = [], edges = [];
 let cam = { x: 0, y: 0, k: 1 };
 let hover = null, dragNode = null, panning = false, last = null, alpha = 1;
+// 连边用：已选中的节点（最多 2）、按下时的节点与坐标（用来区分"点击"与"拖动"）
+let sel = [], downNode = null, downPt = null;
 
 function build() {
   const src = DATA[mode];
@@ -283,6 +318,14 @@ function draw() {
     ctx.globalAlpha = dim ? 0.4 : 1;
     ctx.fill();
     ctx.globalAlpha = 1;
+    // 选中环（连边第一步/第二步的视觉反馈）：见下方 onPick
+    if (sel.indexOf(n) >= 0) {
+      ctx.beginPath();
+      ctx.arc(n.x, n.y, n.r * (isHi ? 1.5 : 1) + 6, 0, Math.PI * 2);
+      ctx.strokeStyle = '#7ee0b8';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
     if (mode === 'page' || isHi || (hi && near.has(n.id))) {
       ctx.fillStyle = dim ? '#3a4255' : '#dfe6f5';
       ctx.font = (mode === 'page' ? '600 12px' : '11px') + ' sans-serif';
@@ -308,6 +351,7 @@ function pick(mx, my) {
 }
 cv.addEventListener('mousedown', (e) => {
   const n = pick(e.clientX, e.clientY);
+  downNode = n; downPt = { x: e.clientX, y: e.clientY };   // 用来区分"点击选中"与"拖动节点"
   if (n) { dragNode = n; } else { panning = true; last = { x: e.clientX, y: e.clientY }; }
   cv.classList.add('drag');
 });
@@ -325,7 +369,12 @@ addEventListener('mousemove', (e) => {
   const n = pick(e.clientX, e.clientY);
   if (n !== hover) { hover = n; showPanel(n); }
 });
-addEventListener('mouseup', () => { dragNode = null; panning = false; last = null; cv.classList.remove('drag'); });
+addEventListener('mouseup', (e) => {
+  // 「点击」判定：按下的还是同一个节点、且位移 < 5px ⇒ 这是点选，不是拖动
+  if (downNode && downPt && Math.hypot(e.clientX - downPt.x, e.clientY - downPt.y) < 5) onPick(downNode);
+  downNode = null; downPt = null;
+  dragNode = null; panning = false; last = null; cv.classList.remove('drag');
+});
 cv.addEventListener('wheel', (e) => {
   e.preventDefault();
   const k2 = Math.max(0.25, Math.min(3.5, cam.k * (e.deltaY > 0 ? 0.92 : 1.08)));
@@ -348,11 +397,172 @@ function showPanel(n) {
 }
 const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
 
+// ============================================================================
+// 连边（2026-11-09）：点两个节点 → 选关系类型 → 生成「可直接粘贴运行」的建边指令
+//
+// 为什么是"生成指令"而不是"页面直接写进去"：浏览器**不能写本机文件**。三条路里
+//   ① 本地 HTTP 服务：要常驻进程 + 端口 + 鉴权，为一次连边不值（也把"能改记忆"的能力
+//      暴露成一个端口）；
+//   ② 生成一行命令（本方案）：零后端、零常驻、零新写盘路径 —— 复用的是**既有**建边入口
+//      tools/rel-apply.mjs（它自带：从原始 title 自动挑唯一 key、幂等、逐页备份、默认干跑）；
+//   ③ 导出 JSON：本方案也保留（一个按钮），但它必然还要再手工跑一次命令 ⇒ 它是②的子集。
+// ⇒ 选②，③作为同一份 JSON 的附带能力；两者用的是同一个 verdicts 结构，A 组的
+//   cli rel add --from-json 将来直接吃这份文件即可。
+//
+// ⚠️ 校验逻辑不写在页面里：gerel* 那套源码与 bank/test-graph-edit.mjs 跑的是**同一份**
+//    （见 tools/graph-edit-lib.mjs 头注释）—— 页面若另写一套，就成了两份实现各跑各的。
+// ============================================================================
+let pairs = [];      // 待连边清单 [{a,b,type}]
+let jsonPath = '';   // 用户填的 JSON 路径（下载后填进来，命令随之更新）
+let pairMsg = '';    // 上一次操作的提示（校验失败原因 / 下一步做什么）
+
+const escAttr = (s) => esc(s).replace(/"/g, '&quot;');
+
+// id → 条目（用来在清单里显示标题）。为什么要显示标题：「页#序号」是**索引编号**，前面增删一条
+// 就整体后移（lessons 里记过这个坑：页#N 编号漂移会让边静默指到别的条目上去）。
+// ⇒ 清单里带上标题，人能一眼核对"连的是不是我以为的那条"，而不是只信一个会漂的编号。
+const ITEM_BY_ID = {};
+for (const n of DATA.item.nodes) ITEM_BY_ID[n.id] = n;
+function titleOf(id) { const n = ITEM_BY_ID[id]; return n ? n.title : ''; }
+function pairCell(id) {
+  const t = titleOf(id);
+  return esc(id) + (t ? '<span class="k">（' + esc(t.length > 16 ? t.slice(0, 16) + '…' : t) + '）</span>' : '');
+}
+
+/** 近似判断：图里已经有一条 rel 边了？（graph-render 的边是按标题近似匹配的，非权威） */
+function existingRel(a, b) {
+  for (let i = 0; i < edges.length; i++) {
+    const e = edges[i];
+    if (e.kind === 'rel' && ((e.a === a && e.b === b) || (e.a === b && e.b === a))) return true;
+  }
+  return false;
+}
+function cmdText() { return gerelMakeCommand(DATA.meta.toolPath, jsonPath, DATA.meta.repoPath); }
+
+function onPick(n) {
+  if (mode !== 'item') {
+    pairMsg = '先在左上切到「条目细节」—— rel 是**条目级**的边，页节点之间不能直接连';
+    renderBar();
+    return;
+  }
+  const at = sel.indexOf(n);
+  if (at >= 0) { sel.splice(at, 1); pairMsg = '已取消这个选择'; renderBar(); return; }
+  if (sel.length >= 2) sel = [];
+  sel.push(n);
+  pairMsg = sel.length === 1 ? '已选第一个：再点第二个节点' : '两端选好了：挑一个关系类型';
+  renderBar();
+}
+
+function addPair(type) {
+  if (sel.length < 2) return;
+  const a = sel[0].id, b = sel[1].id;
+  const v = gerelValidatePair(a, b);
+  if (!v.ok) { pairMsg = '加不进去：' + v.why; sel = []; renderBar(); return; }
+  const k = gerelPairKey(a, b);
+  for (let i = 0; i < pairs.length; i++) {
+    if (gerelPairKey(pairs[i].a, pairs[i].b) === k) { pairMsg = '这一对已经在清单里了'; sel = []; renderBar(); return; }
+  }
+  pairs.push({ a: a, b: b, type: type || '' });
+  pairMsg = '已加入清单（共 ' + pairs.length + ' 对）';
+  sel = [];
+  renderBar();
+}
+
+function downloadJson() {
+  const r = gerelMakeVerdicts(pairs, GEREL_TYPES);
+  if (!r.verdicts.length) { pairMsg = '清单是空的，没什么可导出'; renderBar(); return; }
+  const blob = new Blob([JSON.stringify(r.verdicts, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'rel-edit-' + Date.now() + '.json';
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 3000);
+  pairMsg = '已下载 ' + a.download + '：把下载目录里的完整路径填进上面的输入框（我不猜你的下载目录）';
+  renderBar();
+}
+
+function copyCmd() {
+  const box = document.getElementById('cmdbox');
+  if (!box) return;
+  box.select();
+  let ok = false;
+  try { ok = document.execCommand('copy'); } catch (err) { ok = false; }
+  if (ok) { pairMsg = '命令已复制，粘到终端就能跑'; renderBar(); return; }
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(box.value).then(
+      function () { pairMsg = '命令已复制，粘到终端就能跑'; renderBar(); },
+      function () { pairMsg = '浏览器拒绝了剪贴板：请手动全选文本框复制（file:// 页面常被限制）'; renderBar(); },
+    );
+    return;
+  }
+  pairMsg = '复制失败：请手动全选文本框复制（file:// 页面常被限制剪贴板）';
+  renderBar();
+}
+
+function renderBar() {
+  const bar = document.getElementById('pickbar');
+  if (mode !== 'item') { bar.style.display = 'none'; return; }
+  bar.style.display = 'block';
+  let h = '<div class="row"><span class="lbl">连边：</span><span>' +
+    (sel.length === 0 ? '点一个节点开始' : sel.map(function (n) { return esc(n.id); }).join('  ＋  ')) +
+    '</span>';
+  if (sel.length) h += '<button data-act="cancel">取消选择</button>';
+  if (pairs.length) h += '<button data-act="clear">清空清单</button>';
+  h += '<span class="lbl">清单 ' + pairs.length + ' 对</span></div>';
+  if (sel.length === 2) {
+    h += '<div class="row" style="margin-top:8px"><span class="lbl">关系类型：</span>';
+    for (const t of GEREL_TYPES) {
+      h += '<button data-act="type" data-type="' + t + '" title="' + escAttr(GEREL_HINTS[t] || '') + '">' + t + '</button>';
+    }
+    h += '<button data-act="type" data-type="">不标类型</button><button data-act="cancel" class="warn">算了</button></div>';
+  }
+  if (pairs.length) {
+    h += '<div id="pairlist">';
+    pairs.forEach(function (p, i) {
+      h += '<div class="p"><span>' + pairCell(p.a) + ' ↔ ' + pairCell(p.b) +
+        '<span class="k"> · ' + (p.type ? esc(p.type) : '无类型') + (existingRel(p.a, p.b) ? ' · 疑似已有边' : '') + '</span></span>' +
+        '<button data-act="del" data-i="' + i + '">删除</button></div>';
+    });
+    h += '</div>';
+    h += '<div class="row" style="margin-top:8px"><span class="lbl">JSON 路径：</span>' +
+      '<input id="jsonpath" placeholder="下载后把完整路径填这里" value="' + escAttr(jsonPath) + '"></div>';
+    h += '<textarea id="cmdbox" readonly rows="2">' + esc(cmdText()) + '</textarea>';
+    h += '<div class="row" style="margin-top:6px"><button data-act="copy">复制指令</button>' +
+      '<button data-act="download">下载 JSON</button>' +
+      '<span class="dim">跑完后按它打印的提示 reindex 一次，图谱才会刷新</span></div>';
+  }
+  if (pairMsg) h += '<div class="hint">' + esc(pairMsg) + '</div>';
+  bar.innerHTML = h;
+}
+
+document.getElementById('pickbar').addEventListener('click', function (ev) {
+  const t = ev.target;
+  if (!t || !t.getAttribute) return;
+  const act = t.getAttribute('data-act');
+  if (!act) return;
+  if (act === 'type') addPair(t.getAttribute('data-type') || '');
+  else if (act === 'del') { pairs.splice(Number(t.getAttribute('data-i')), 1); pairMsg = '已删除一条'; renderBar(); }
+  else if (act === 'clear') { pairs = []; sel = []; pairMsg = '清单已清空'; renderBar(); }
+  else if (act === 'cancel') { sel = []; pairMsg = ''; renderBar(); }
+  else if (act === 'copy') copyCmd();
+  else if (act === 'download') downloadJson();
+});
+// 路径输入：只更新命令框，不整块重绘（否则输入到一半焦点就飞了）
+document.getElementById('pickbar').addEventListener('input', function (ev) {
+  if (ev.target && ev.target.id === 'jsonpath') {
+    jsonPath = ev.target.value;
+    const box = document.getElementById('cmdbox');
+    if (box) box.value = cmdText();
+  }
+});
+
 // 图例
 const lg = document.getElementById('legend');
 lg.innerHTML = DATA.page.nodes.slice(0, 10).map((p) =>
   '<div><span class="dot" style="background:' + PAGE_COLORS[p.id] + '"></span>' + esc(p.id) + '</div>').join('') +
-  '<div style="margin-top:6px;color:#5c6478">亮线=人工 rel 边　暗线=共现<br>滚轮缩放 · 拖拽平移/拖动节点</div>';
+  '<div style="margin-top:6px;color:#5c6478">亮线=人工 rel 边　暗线=共现<br>滚轮缩放 · 拖拽平移/拖动节点' +
+  '<br><span style="color:#7ee0b8">连边：切到「条目细节」→ 点两个节点 → 选关系类型 → 复制指令</span></div>';
 
 document.getElementById('tPage').onclick = () => setMode('page');
 document.getElementById('tItem').onclick = () => setMode('item');
@@ -361,10 +571,13 @@ function setMode(m) {
   document.getElementById('tPage').className = m === 'page' ? 'on' : '';
   document.getElementById('tItem').className = m === 'item' ? 'on' : '';
   cam = { x: 0, y: 0, k: 1 };
+  sel = []; pairMsg = '';   // 换视图后旧节点对象已不在 nodes 里，选择必须清掉
   build();
+  renderBar();
 }
 
 build();
+renderBar();   // 初始 mode='page' ⇒ 连边面板隐藏；切到「条目细节」后出现
 let frame = 0;
 function loop() {
   tick();

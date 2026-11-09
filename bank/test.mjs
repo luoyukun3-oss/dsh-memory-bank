@@ -18,9 +18,19 @@ import { auditPatchStatus } from './patch-status.mjs';
 import { auditDegenerate } from './degenerate-audit.mjs';
 import { detectGuardDegenerate } from './guard-degen-detect.mjs';
 import { observeStalls } from './stall-detect.mjs';
-import { auditDependencies } from './dep-audit.mjs';
+import { runArchTests } from './test-arch.mjs';    // 第 16/17 节：零依赖红线 + 配置键同步（2026-11-09 拆出）
+import { runCueTests } from './test-cue.mjs';       // 第 26 节：触发式联想（2026-11-09 拆出）
 import { runTranscriptTests } from './test-transcripts.mjs';
 import { runFactKeyTests } from './test-factkey.mjs';   // 事实键（2026-11-02）   // 多根会话发现（2026-10-29 接线：文件早就在，只是没被 import 过）
+import { runNoLeakTests } from './test-noleak.mjs';   // 第 28 节：防自污染（2026-11-08 按域拆出）
+import { runSafeWriteTests } from './test-safewrite.mjs';   // 第 29 节：并发安全写（2026-11-08）
+import { runAssembleTests } from './test-assemble.mjs';   // 第 29 节：预算装配不丢条目（2026-11-08）
+import { runIngestCursorTests } from './test-ingest-cursor.mjs';   // 第 30 节：摄入游标不重复/不空转（2026-11-08）
+import { runAccessDecayTests } from './test-access-decay.mjs';     // 第 31 节：软遗忘按召回时间衰减（2026-11-08）
+import { runThresholdTests } from './test-threshold.mjs';          // 第 32 节：阈值标定不能悄悄失效（2026-11-08）
+import { runSyncGuardTests } from './test-sync-guard.mjs';         // 第 33 节：sync --apply 不许抹掉页面独有行（2026-11-08）
+import { runAtomicWriteTests } from './test-atomic-write.mjs';     // 第 34 节：全量写必须原子（2026-11-08）
+import { runIndexGuardTests } from './test-index-guard.mjs'; import { runIndexSchemaTests } from './test-index-schema.mjs'; import { runIndexRebuildTests } from './test-index-rebuild.mjs'; import { runConfigClampTests } from './test-config-clamp.mjs'; import { runTidyOrderTests } from './test-tidy-order.mjs'; import { runBakRotateTests } from './test-bak-rotate.mjs'; import { runRelEditTests } from './test-rel-edit.mjs'; import { runGraphEditTests } from './test-graph-edit.mjs'; import { runEvStampTests } from './test-ev-stamp.mjs'; import { runReflectPerfTests } from './test-reflect-perf.mjs'; import { runMoodDangerTests } from './test-mood-danger.mjs'; import './test-extract.mjs'; import './test-tick-maintain.mjs';   // 第 35~46 节（extract/tick-maintain 自执行）
 import { runLessonsAuditTests } from './test-lessons-audit.mjs';   // 哑弹审计键错位（2026-11-08）
 import { runHandoffThinTests } from './test-handoff-thin.mjs';     // handoff 空泛小结降级（2026-11-08）
 import { ensureFixtureBank, FIXTURE } from './test-fixture.mjs';   // 夹具银行（2026-11-08：clone 下来也能跑全测试）
@@ -333,95 +343,9 @@ ok(dr.candidates.every((c) => c.a !== c.b && c.shared >= 3), '每组都是两个
 ok(dr.candidates.every((c) => c.words.every((w) => !isNoise(w))), '罕见词里没有数字/停用词（isNoise 真的生效了）');
 ok(dr.hubs.every((h) => h.degree >= 8), `枢纽页的度都 ≥ 阈值（本次排出 ${dr.hubs.length} 个）`);
 
-console.log('== 16. 零依赖红线（借自 dsh-pet：架构约束由测试守护） ==');
-// 起因：hook 跑在 DSH 受限沙箱里，第三方依赖一旦缺失就**静默失败**（注入消失比报错难查得多）；
-// 同时本轮把测试自身 `file:///E:/2/...` 的硬编码 import 改成相对路径 ⇒ 换目录不再自崩。
-const dep = auditDependencies();
-ok(dep.files >= 10, `扫了 ${dep.files} 个模块`);
-ok(dep.violations.length === 0, '没有第三方依赖 / 绝对路径 import',
-  dep.violations.map((v) => `${v.file}:${v.line} → ${v.spec}`).join('; '));
-ok(dep.specifiers.every((s) => s.kind === 'builtin' || s.kind === 'relative'),
-  `${dep.specifiers.length} 个依赖说明符全部合规（node: 内建 or 相对路径）`);
 
-console.log('== 17. 配置键三处同步（借 dsh-pet：新增键必须登记，值不许再写一遍） ==');
-// 起因是实测到的漂移：MIN_SCORE 于 2026-09-17 由 1.2 上调 1.5，可是 recall-eval 抄了一份
-// 靠行尾注释人肉对齐、bank.mjs 两处注释至今仍写着 1.2 —— 纸面约定（注释）挡不住漂移。
-// dsh-pet 的解法是「默认值 + 白名单 + 测试快照」三处登记，这里等价成「登记表 + 消费点 + 文档一致」。
-const ck = await import('./config-keys.mjs');
-const consumers = Object.entries(ck.CONSUMERS);
-ok(consumers.length >= 3, `登记表覆盖 ${consumers.length} 个配置键（值只在 config-keys.mjs 定义）`);
-const missRef = [];
-for (const [key, files] of consumers) {
-  for (const f of files) {
-    const src = fs.readFileSync(path.join(memRoot, f), 'utf8');
-    if (!new RegExp(`\\b${key}\\b`).test(src)) missRef.push(`${f} 里找不到 ${key}`);
-  }
-}
-ok(missRef.length === 0, '声明的消费点都真的引用了登记表（没退回硬编码）', missRef.join('; '));
-// 文档漂移是这类问题最常见的形态：文档里写的数字必须等于代码里的值
-const todoHead = fs.readFileSync(path.join(real, 'pages', 'todos.md'), 'utf8');
-const docBudget = Number((todoHead.match(/总预算\s*(\d+)\s*字/) || [])[1]);
-ok(docBudget === ck.INJECT_BUDGET, `todos.md 头写的总预算与登记表一致（文档 ${docBudget} / 代码 ${ck.INJECT_BUDGET}）`);
-// 2026-10-13 实测踩到：往 note 里插了一个半角双引号 ⇒ budgets.json 解析失败 ⇒ 而 `readJson(..., {}).budgets || {}`
-// **静默退化成「0 个文件」**，行数红线整条失效却不报错（当时唯一信号是断言总数 261→192）。这里专门盯它。
-let bj = {}; try { bj = JSON.parse(fs.readFileSync(path.join(memRoot, 'bank', 'budgets.json'), 'utf8')).budgets || {}; } catch { bj = {}; }
-ok(Object.keys(bj).length > 0, `budgets.json 能解析出 budgets 表（${Object.keys(bj).length} 项）—— 它坏掉会让行数红线**静默**失效`);
-
-console.log('== 26. 触发式联想（cue：词 → 条目，不等主命中） ==');
-// 全部用**构造数据**（不依赖真库内容）：真实知识页每天都在长，拿真页做断言会变成"每天变红的测试"。
-// 覆盖 6 件事：词长判据 / 命中与上限 / output 只认 cue 档 / 无关不触发 / 低置信与元页排除 / df 门两个方向。
-const { buildCueTable, matchCues, formatCueNote, cueWordOk } = await import('./cue.mjs');
-const { CUE_MAX_HITS: CUE_MAX_HITS_TEST } = await import('./config-keys.mjs');
-const mkDoc = (id, page, title, text, meta = {}, tokens = []) => ({ id, page, kind: 'page', title, text, meta, tokens });
-ok(cueWordOk('乱码') && !cueWordOk('乱') && !cueWordOk('乱 码') && !cueWordOk('1234'),
-  '触发词判据：≥2 字、无空白/标点、非纯数字');
-const cdocs = [
-  mkDoc('lessons.md#1', 'lessons.md', '编码坑', '看到乱码先查编码', { cues: ['乱码', 'GBK'], importance: 4 }),
-  mkDoc('lessons.md#2', 'lessons.md', '另一条编码坑', '乱码与 BOM', { cues: ['乱码'] }),
-  mkDoc('faults.md#1', 'faults.md', '卡顿', '性能问题', { tags: ['性能'] }),
-  mkDoc('decisions.md#1', 'decisions.md', '某决策', '乱码', { cues: ['乱码'], confidence: 'low' }),
-];
-const ctab = buildCueTable(cdocs);
-const ch = matchCues(ctab, '这段输出是乱码', 'prompt');
-ok(ch.length === 2 && ch.every((h) => h.level === 'cue'), '命中触发词，且最多 2 条');
-ok(!matchCues(ctab, '这段输出是乱码', 'output').some((h) => h.level === 'tag'),
-  'output 模式（工具输出）只认 cue 档 —— 海量文本里泛词会漫天误触发');
-ok(matchCues(ctab, '我们聊点别的', 'prompt').length === 0, '无关文本不触发（保持安静）');
-ok(!JSON.stringify(matchCues(ctab, '乱码', 'prompt')).includes('decisions.md'), 'confidence=low 的条目不参与联想');
-ok(!Object.keys(buildCueTable([mkDoc('handoff.md#0', 'handoff.md', '交接', 'x', { cues: ['乱码'] })]).words).length
-  && !Object.keys(buildCueTable([mkDoc('inbox.md#0', 'inbox.md', '原料', 'x', { cues: ['乱码'] })]).words).length,
-  '元页（handoff）/ 原料页（inbox）不参与联想');
-const note = formatCueNote(matchCues(ctab, '乱码', 'prompt'));
-ok(note.startsWith('（联想触发 · 看到「乱码」）'), '注入段开头写明"因为看到哪个词"');
-ok((note.match(/看到「乱码」/g) || []).length === 1, '同一个词只报一次（两条记忆由同一词带出时）');
-ok(formatCueNote([]) === '', '无命中返回空串（安静退出，不注入废话）');
-// df 门（2026-10-13 拿真库标定：泛词当触发词会让装置每轮都触发）—— 两个方向都要测，只测一边等于没测
-const wide = Array.from({ length: 30 }, (_, i) => mkDoc(`w.md#${i}`, 'w.md', '泛词条目', '泛词', { tags: ['泛词'] }, ['泛词']));
-ok(Object.keys(buildCueTable(wide).words).length === 0, 'df 门：30/30 条都含的词（t: 标签）不当触发词');
-const narrow = [...wide, mkDoc('w.md#z', 'w.md', '冷门条目', '冷门', { tags: ['冷门'] }, ['冷门'])];
-ok(!!buildCueTable(narrow).words['冷门'], 'df 门：31 条里只有 1 条含的词照常当触发词');
-// 2026-10-29 推翻 10-13 的「人工标注 ⇒ 免检 df 门」：体检实测「实测」df 23.4%、却只挂 1 条
-// ⇒ scoreCueHits 归一化后 p=1.00，独占唯一的 CUE_BODY_HITS 正文名额 ⇒ **每轮无条件注入同一条
-// 无关记忆**（日常句误报 1/8，且 100% 来自「环境」）。人工标注 ≠ 不会写出泛词。
-// 现在 cue 与 tag 同门；df < 8% 的「环境/静默/rev」本门挡不住，靠删页面标注处理。
-ok(!buildCueTable([mkDoc('a.md#1', 'a.md', '人工标注', 'x', { cues: ['泛词'] }, ['泛词'])]).words['泛词'],
-  'cue: 也过 df 门（10-13 的「人工标注免检」已被 10-29 实测推翻）');
-// `+` = 空格：报错原文才是最好的触发词（「看到 has not been read 就想起那条」比"看到 write"精确得多），
-// 可注释按空白切分 ⇒ 只能这样写。这条判据不测就会在某次重构里静默失效（词表里多出一个带 + 的怪词）。
-ok(!!buildCueTable([mkDoc('a.md#2', 'a.md', '原文', 'x', { cues: ['has+not+been+read'] })]).words['has not been read'],
-  'cue: 里的 `+` 还原成空格（报错原文当触发词）');
-// output 词筛（2026-10-13 回放标定：不加这道门，工具输出命中率 55% ⇒ write/hook/window 这类词淹掉上下文）
-// ⚠️ 构造必须落在 (CUE_DF_MAX_OUTPUT 5%, CUE_DF_MAX 8%) 的**交集区间**：低于 5% 不标 weak，
-// 高于 8% 会被 cue 档的门直接挡掉（2026-10-29 起 cue 也过门）⇒ 8/120 = 6.67% 两边都测得到，
-// 且命中数必须 = CUE_MAX_HITS(8) 才测得出「截断」这一步。
-const mixDocs = [
-  ...Array.from({ length: 8 }, (_, i) => mkDoc(`m.md#${i}`, 'm.md', '常见词条目', '常见词', { cues: ['常见词'] })),
-  ...Array.from({ length: 112 }, (_, i) => mkDoc(`m.md#x${i}`, 'm.md', '冷门条目', '冷门内容')),
-];
-const mtab = buildCueTable(mixDocs);
-ok(mtab.weak?.['常见词'] === true, 'output 词筛：库内 df 高于 CUE_DF_MAX_OUTPUT 的词被标 weak');
-ok(matchCues(mtab, '常见词', 'prompt').length === CUE_MAX_HITS_TEST && matchCues(mtab, '常见词', 'output').length === 0,
-  'weak 词在 prompt 模式照常触发、在 output 模式被挡（两档标准不同，别一刀切）');
+runArchTests({ ok, memRoot, real });   // 第 16 零依赖红线 + 第 17 配置键三处同步（2026-11-09 拆到 test-arch.mjs）
+runCueTests({ ok });                   // 第 26 触发式联想（2026-11-09 拆到 test-cue.mjs）
 
 runRelCueTests({ ok, real });   // 第 21b 节：cue/rel 的静默错误守护（2026-10-27 拆到 test-rel.mjs，本文件预算 440 行）
 
@@ -431,6 +355,17 @@ runAssocTests({ ok, real });                // 第 21 节：联想扩散的不�
 runTranscriptTests({ ok });                  // 第 22 节：findTranscripts 多根合并（2026-10-29 接线，此前是孤儿测试）
 runLessonsAuditTests({ ok });                // 第 27 节：哑弹审计的键口径（2026-11-08 修 192 条假阳性）
 runHandoffThinTests({ ok });                 // 第 3g 节：handoff 空泛小结降级（2026-11-08）
+console.log('== 28. 测试样例不得写进知识页（防自污染，2026-11-08，按域拆到 test-noleak.mjs） ==');
+runNoLeakTests({ ok, repoDir });
+runSafeWriteTests({ ok });   // 第 29 节：并发安全写（2026-11-08，讨论区指出 sync 会静默覆盖用户手改）
+runAssembleTests({ ok });    // 第 29b 节：召回预算装配（标题在各测试文件内部打印，本文件只留调用）
+runIngestCursorTests({ ok });   // 第 30 节：摄入游标
+runAccessDecayTests({ ok });    // 第 31 节：软遗忘按召回时间衰减
+// 第 32 节：阈值标定守护 —— `INJECT_MIN_SCORE` 是绝对值、分数标度跟着索引规模漂
+// （实测：index 去重 2288→1056 让相关触发从 15/18 掉到 11/18，而代码一行没改）
+runThresholdTests({ ok, real, hasLocalBank });
+runSyncGuardTests({ ok }); runAtomicWriteTests({ ok }); runIndexGuardTests({ ok }); runIndexSchemaTests({ ok }); runIndexRebuildTests({ ok }); runConfigClampTests({ ok }); runTidyOrderTests({ ok }); runBakRotateTests({ ok }); runRelEditTests({ ok }); runGraphEditTests({ ok }); runEvStampTests({ ok }); runReflectPerfTests({ ok }); runMoodDangerTests({ ok });   // 第 33~46 节（标题在各自测试文件内打印）
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败` + (skip ? ` / ${skip} 跳过（本环境不适用）` : ''));
 
 process.exitCode = fail ? 1 : 0;

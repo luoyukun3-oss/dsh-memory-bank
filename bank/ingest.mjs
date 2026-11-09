@@ -83,6 +83,22 @@ export function scoreCandidate(raw) {
   if (/^\s*【定时待办】/.test(s)) {
     score -= 0.6;
   }
+  // ⑨ 指代不明 —— **代词开头 + 短句 = 没说清在指谁**（2026-11-08）
+  //   来源：hwshsh《大肥鱼技术手记》的「模糊丢弃」——他实测被「他把他记成捡的了」
+  //   这类糊话坑出来的（原话：代词开头、短于十个字、又不是主人说的，直接不记）。
+  //   我们的 inbox 反复清的也正是这类：纯指路、半句话、无主语的碎语。
+  //   ⚠️ 只**降分不硬毙**：他的缺点是「偏保守会漏掉能用的碎片」，所以留一条缝 ——
+  //   若句子里出现具体指代对象（路径 / 文件名 / 反引号代码 / 数字），视为说清楚了，不扣。
+  //   ⚠️ 阈值 12 是**实测调过的**：先用 20 时「这个项目用 Python 写的」(16 字符) 被误伤 ——
+  //   它不是指代不明，是说清了主题。他的原话也是「短于十个字」，12 留一点余量。
+  //   ⚠️ 还要排除**偏好/情感陈述**：「她喜欢先看代码」是 7 字代头，但它是真偏好不是糊话 ——
+  //   实测被误挡过一次（规则⑥只认「我喜欢」不认「她喜欢」），故这里加白。
+  const PRONOUN_HEAD = /^\s*(他|她|它|他们|她们|它们|这|那|这个|那个|这些|那些|这样|那样|其|此|该|上面|下面|前面|后面)/;
+  const HAS_ANCHOR = /[\\/][\w.-]+\.\w+|`[^`]+`|[\w-]+\.(py|mjs|js|md|json|ya?ml|txt|html|docx?)\b|\d{2,}/;
+  const IS_PREFERENCE = /喜欢|不喜欢|讨厌|习惯|想要|希望|偏好|愿意|爱用|不用|以后/;
+  if (PRONOUN_HEAD.test(s) && s.length <= 12 && !HAS_ANCHOR.test(s) && !IS_PREFERENCE.test(s)) {
+    score -= 0.35;
+  }
   return Math.max(0, Math.min(1, score));
 }
 
@@ -125,14 +141,40 @@ export function ingest(dir, { transcript, cwd, full = false } = {}) {
   for (const { file } of list.slice(0, full ? 999 : 5)) {
     if (!fs.existsSync(file)) continue;
     const key = path.basename(path.dirname(file));
+    // —— 指纹跳过（2026-11-09）：文件 size+mtime 没变就跳过解压。
+    //    `handoff` 早就有这个优化（stamp 记 文件名:size:mtime，把"47/48 次白干"压到 0），
+    //    ingest 一直缺 —— 它每次都解压最近 5 个会话（实测 12 MB / 1.4 万条记录），
+    //    **没新消息也解压**。这里在 readRecords **之前** 判断，整段省掉。
+    //    ⚠️ 指纹用 `size:mtimeMs`：size 防内容长度变、mtime 防同长度被改写（DSH 轮转会换 mtime）。
+    //    ⚠️ `--full` 强制重读（不跳过），因为 full 的语义就是"从零重建"。
+    const stamps = state.stamps || {};
+    if (!full) {
+      let st;
+      try { st = fs.statSync(file); } catch { continue; }
+      const fp = `${st.size}:${st.mtimeMs}`;
+      if (stamps[key] === fp) continue;   // 没变 ⇒ 跳过整段解压 + 扫描
+      stamps[key] = fp;                    // 变了（或首次）⇒ 记下新指纹
+      state.stamps = stamps;
+    }
     let recs;
     try { recs = readRecords(file); } catch { continue; }
     let start = full ? 0 : (state.offsets[key] || 0);
     // 2026-09-15 修复：会话日志被压缩/轮转后记录数会变小，旧偏移超过长度 →
     // slice() 永远返回空 → 该会话被永久漏读。检测到就回退全量。
-    if (start > recs.length) start = 0;
+    // ⚠️ 2026-11-08 补：**回退全量会重写整段流水**（下面 jfText 是"读旧文件 + 追加新段"），
+    //    于是一次越界就把该会话的全部历史重灌一遍。实测 journal 里 716 段完全重复、
+    //    占 24.3%（466 KB / 1.87 MB），最狠的一页 2026-09-30.md 有 86% 是重灌的。
+    //    ⇒ 回退时**先清掉该会话的旧段**（与 `--full` 分支同一套清理逻辑），重写才是幂等的。
+    const expired = start > recs.length;
+    if (expired) start = 0;
     const slice = recs.slice(start);
-    if (!slice.length) continue;
+    // 空切片也要走"写流水"分支（2026-11-08）：原实现 `continue` ⇒ 偏移永不推进，
+    //   而 tick 每 30 分钟跑一次 ⇒ 每轮都往 journal 追加一个只有标题的空段
+    //   （实测今天一个会话 99 段里 23 段是空的）。现在让它把偏移写回去并落一段说明。
+    if (!slice.length && !expired) {
+      state.offsets[key] = recs.length;
+      continue;
+    }
 
     // —— 复述效应回填：hook 跑在 read-only 沙箱、**写不了 access.json**，但它把每轮命中集
     //    通过 stderr 喊了出来（`HITS:页#id,...`），被 DSH 记进会话日志的 hook/result.stderrSummary。
@@ -189,10 +231,11 @@ export function ingest(dir, { transcript, cwd, full = false } = {}) {
     const jfHead = `# 会话流水 ${day(new Date(Number(users[0]?.time) || Date.now()))}\n`;
     const jf = path.join(dir, 'journal', `${day(new Date(Number(users[0]?.time) || Date.now()))}.md`);
     let jfText = readText(jf) || jfHead;
-    if (full) {
+    if (full || expired) {
       // 2026-09-15 修复：--full 从 0 重读全部记录，原逻辑会把同一会话再追加一遍 → 重跑不幂等。
       // 注意：同一会话的流水可能散落在**多个日期文件**里（会话跨天 + 增量写入），
       // 所以必须在整个 journal 目录里清掉该会话的旧段，而不是只清目标文件。
+      // 2026-11-08：`expired`（偏移越界）走同一套 —— 它同样是"从 0 重读"，不清就重灌。
       const jdir = path.join(dir, 'journal');
       for (const f of fs.readdirSync(jdir).filter((x) => x.endsWith('.md'))) {
         const p = path.join(jdir, f);
@@ -205,7 +248,8 @@ export function ingest(dir, { transcript, cwd, full = false } = {}) {
     }
     if (!jfText.trim()) jfText = jfHead;
     const lines = [jfText];
-    lines.push(`\n## 会话 ${key}（本次处理 ${slice.length} 条记录）\n`);
+    // 2026-11-08：越界重读时标出来 —— 否则流水里看不出"这一段为什么突然重来了一遍"。
+    lines.push(`\n## 会话 ${key}（本次处理 ${slice.length} 条记录${expired ? '｜⚠️ 偏移越界，已重读' : ''}）\n`);
     for (const u of users) {
       const t = clip(u.text, 300);
       lines.push(`- **[用户]** ${zh(new Date(Number(u.time)))} ${t}`);
